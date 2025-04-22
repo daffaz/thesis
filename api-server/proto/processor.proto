@@ -1,0 +1,67 @@
+syntax = "proto3";
+
+package pdf_processor;
+
+option go_package = "server_pdf_processor/pkg/pdf/pdf_processor";
+
+service PDFProcessor {
+  // Process a PDF document
+  rpc ProcessDocument (ProcessRequest) returns (ProcessResponse) {}
+  
+  // Get processing status
+  rpc GetStatus (StatusRequest) returns (StatusResponse) {}
+  
+  // Stream PII detection results
+  rpc StreamPIIDetection (DocumentStream) returns (stream PIIDetectionResult) {}
+}
+
+message ProcessRequest {
+  bytes document = 1;           // The PDF document bytes
+  string filename = 2;          // Original filename
+  ProcessingOptions options = 3;  // Processing options
+}
+
+message ProcessingOptions {
+  bool enable_redaction = 1;
+  repeated string redaction_types = 2;
+  bool enable_translation = 3;
+  string target_language = 4;
+  bool preserve_formatting = 5;
+}
+
+message ProcessResponse {
+  string job_id = 1;
+  string original_filename = 2;
+  map<string, string> metadata = 3;
+  RedactionStats redaction_stats = 4;
+}
+
+message RedactionStats {
+  int32 total_pii_count = 1;
+  map<string, int32> by_type = 2;
+  map<string, int32> by_method = 3;
+  map<string, int32> by_page = 4;
+}
+
+message StatusRequest {
+  string job_id = 1;
+}
+
+message StatusResponse {
+  string job_id = 1;
+  string status = 2;
+  string output_file = 3;
+}
+
+message DocumentStream {
+  bytes document = 1;
+  string filename = 2;
+}
+
+message PIIDetectionResult {
+  string pii_text = 1;
+  string pii_type = 2;
+  int32 page = 3;
+  int32 start = 4;
+  int32 end = 5;
+}

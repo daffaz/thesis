@@ -1,0 +1,65 @@
+version: '3.8'
+
+services:
+  api-server:
+    build:
+      context: ./api-server
+      dockerfile: Dockerfile.debug
+    ports:
+      - "8080:8080"
+      - "40000:40000"
+    entrypoint: ["sh", "-c", "dlv debug --headless --listen=:40000 --api-version=2 --accept-multiclient --log ./cmd/server"]
+    security_opt:
+      - "seccomp:unconfined"
+    cap_add:
+      - SYS_PTRACE
+    depends_on:
+      - pdf-processor
+    environment:
+      - APP_SERVICES_PDFPROCESSOR_HOST=pdf-processor
+      - APP_SERVICES_PDFPROCESSOR_PORT=50051
+      - APP_LOGGING_LEVEL=info
+    volumes:
+      - ./api-server:/app/src
+      - ./api-server/script:/app/script
+      - ./data:/app/data
+    restart: unless-stopped
+
+  pdf-processor:
+    build: ./pdf-processor
+    volumes:
+      - ./pdf-processor/src:/app/src
+      - ./data:/app/data
+    ports:
+      - "50051:50051"
+    environment:
+      - LOG_LEVEL=INFO
+      - ENABLE_PII_DETECTION=true
+      - ENABLE_OCR=true
+    restart: unless-stopped
+
+  # This will be added later when you implement full document storage
+  # minio:
+  #   image: minio/minio
+  #   ports:
+  #     - "9000:9000"
+  #     - "9001:9001"
+  #   volumes:
+  #     - ./data/minio:/data
+  #   environment:
+  #     - MINIO_ROOT_USER=minioadmin
+  #     - MINIO_ROOT_PASSWORD=minioadmin
+  #   command: server /data --console-address ":9001"
+  #   restart: unless-stopped
+
+  # This will be added later for translation services
+  # translation-service:
+  #   build: ./translation-service
+  #   volumes:
+  #     - ./translation-service:/app
+  #     - ./data:/app/data
+  #   ports:
+  #     - "50052:50052"
+  #   environment:
+  #     - MODEL_PATH=/app/models
+  #   restart: unless-stopped

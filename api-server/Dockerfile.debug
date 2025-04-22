@@ -1,0 +1,15 @@
+# Dockerfile.debug
+FROM golang:1.24-alpine
+
+# Install delve debugger
+RUN go install github.com/go-delve/delve/cmd/dlv@latest
+
+WORKDIR /app
+
+# Copy the source code
+COPY . .
+
+# Install dependencies
+RUN go mod download
+
+# The application will be started using delve in the docker-compose command
