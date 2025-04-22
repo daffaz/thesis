@@ -24,7 +24,7 @@ _sym_db = _symbol_database.Default()
 
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x0fprocessor.proto\x12\rpdf_processor\"g\n\x0eProcessRequest\x12\x10\n\x08\x64ocument\x18\x01 \x01(\x0c\x12\x10\n\x08\x66ilename\x18\x02 \x01(\t\x12\x31\n\x07options\x18\x03 \x01(\x0b\x32 .pdf_processor.ProcessingOptions\"\x98\x01\n\x11ProcessingOptions\x12\x18\n\x10\x65nable_redaction\x18\x01 \x01(\x08\x12\x17\n\x0fredaction_types\x18\x02 \x03(\t\x12\x1a\n\x12\x65nable_translation\x18\x03 \x01(\x08\x12\x17\n\x0ftarget_language\x18\x04 \x01(\t\x12\x1b\n\x13preserve_formatting\x18\x05 \x01(\x08\"\xe5\x01\n\x0fProcessResponse\x12\x0e\n\x06job_id\x18\x01 \x01(\t\x12\x19\n\x11original_filename\x18\x02 \x01(\t\x12>\n\x08metadata\x18\x03 \x03(\x0b\x32,.pdf_processor.ProcessResponse.MetadataEntry\x12\x36\n\x0fredaction_stats\x18\x04 \x01(\x0b\x32\x1d.pdf_processor.RedactionStats\x1a/\n\rMetadataEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\t:\x02\x38\x01\"\xf0\x02\n\x0eRedactionStats\x12\x17\n\x0ftotal_pii_count\x18\x01 \x01(\x05\x12:\n\x07\x62y_type\x18\x02 \x03(\x0b\x32).pdf_processor.RedactionStats.ByTypeEntry\x12>\n\tby_method\x18\x03 \x03(\x0b\x32+.pdf_processor.RedactionStats.ByMethodEntry\x12:\n\x07\x62y_page\x18\x04 \x03(\x0b\x32).pdf_processor.RedactionStats.ByPageEntry\x1a-\n\x0b\x42yTypeEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\x05:\x02\x38\x01\x1a/\n\rByMethodEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\x05:\x02\x38\x01\x1a-\n\x0b\x42yPageEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\x05:\x02\x38\x01\"\x1f\n\rStatusRequest\x12\x0e\n\x06job_id\x18\x01 \x01(\t\"E\n\x0eStatusResponse\x12\x0e\n\x06job_id\x18\x01 \x01(\t\x12\x0e\n\x06status\x18\x02 \x01(\t\x12\x13\n\x0boutput_file\x18\x03 \x01(\t\"4\n\x0e\x44ocumentStream\x12\x10\n\x08\x64ocument\x18\x01 \x01(\x0c\x12\x10\n\x08\x66ilename\x18\x02 \x01(\t\"b\n\x12PIIDetectionResult\x12\x10\n\x08pii_text\x18\x01 \x01(\t\x12\x10\n\x08pii_type\x18\x02 \x01(\t\x12\x0c\n\x04page\x18\x03 \x01(\x05\x12\r\n\x05start\x18\x04 \x01(\x05\x12\x0b\n\x03\x65nd\x18\x05 \x01(\x05\x32\x8a\x02\n\x0cPDFProcessor\x12R\n\x0fProcessDocument\x12\x1d.pdf_processor.ProcessRequest\x1a\x1e.pdf_processor.ProcessResponse\"\x00\x12J\n\tGetStatus\x12\x1c.pdf_processor.StatusRequest\x1a\x1d.pdf_processor.StatusResponse\"\x00\x12Z\n\x12StreamPIIDetection\x12\x1d.pdf_processor.DocumentStream\x1a!.pdf_processor.PIIDetectionResult\"\x00\x30\x01\x62\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x0fprocessor.proto\x12\rpdf_processor\"g\n\x0eProcessRequest\x12\x10\n\x08\x64ocument\x18\x01 \x01(\x0c\x12\x10\n\x08\x66ilename\x18\x02 \x01(\t\x12\x31\n\x07options\x18\x03 \x01(\x0b\x32 .pdf_processor.ProcessingOptions\"\xb1\x01\n\x11ProcessingOptions\x12\x18\n\x10\x65nable_redaction\x18\x01 \x01(\x08\x12\x17\n\x0fredaction_types\x18\x02 \x03(\t\x12\x1a\n\x12\x65nable_translation\x18\x03 \x01(\x08\x12\x17\n\x0fsource_language\x18\x04 \x01(\t\x12\x17\n\x0ftarget_language\x18\x05 \x01(\t\x12\x1b\n\x13preserve_formatting\x18\x06 \x01(\x08\"\xe5\x01\n\x0fProcessResponse\x12\x0e\n\x06job_id\x18\x01 \x01(\t\x12\x19\n\x11original_filename\x18\x02 \x01(\t\x12>\n\x08metadata\x18\x03 \x03(\x0b\x32,.pdf_processor.ProcessResponse.MetadataEntry\x12\x36\n\x0fredaction_stats\x18\x04 \x01(\x0b\x32\x1d.pdf_processor.RedactionStats\x1a/\n\rMetadataEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\t:\x02\x38\x01\"\xf0\x02\n\x0eRedactionStats\x12\x17\n\x0ftotal_pii_count\x18\x01 \x01(\x05\x12:\n\x07\x62y_type\x18\x02 \x03(\x0b\x32).pdf_processor.RedactionStats.ByTypeEntry\x12>\n\tby_method\x18\x03 \x03(\x0b\x32+.pdf_processor.RedactionStats.ByMethodEntry\x12:\n\x07\x62y_page\x18\x04 \x03(\x0b\x32).pdf_processor.RedactionStats.ByPageEntry\x1a-\n\x0b\x42yTypeEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\x05:\x02\x38\x01\x1a/\n\rByMethodEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\x05:\x02\x38\x01\x1a-\n\x0b\x42yPageEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\x05:\x02\x38\x01\"\x1f\n\rStatusRequest\x12\x0e\n\x06job_id\x18\x01 \x01(\t\"E\n\x0eStatusResponse\x12\x0e\n\x06job_id\x18\x01 \x01(\t\x12\x0e\n\x06status\x18\x02 \x01(\t\x12\x13\n\x0boutput_file\x18\x03 \x01(\t\"4\n\x0e\x44ocumentStream\x12\x10\n\x08\x64ocument\x18\x01 \x01(\x0c\x12\x10\n\x08\x66ilename\x18\x02 \x01(\t\"b\n\x12PIIDetectionResult\x12\x10\n\x08pii_text\x18\x01 \x01(\t\x12\x10\n\x08pii_type\x18\x02 \x01(\t\x12\x0c\n\x04page\x18\x03 \x01(\x05\x12\r\n\x05start\x18\x04 \x01(\x05\x12\x0b\n\x03\x65nd\x18\x05 \x01(\x05\x32\x8a\x02\n\x0cPDFProcessor\x12R\n\x0fProcessDocument\x12\x1d.pdf_processor.ProcessRequest\x1a\x1e.pdf_processor.ProcessResponse\"\x00\x12J\n\tGetStatus\x12\x1c.pdf_processor.StatusRequest\x1a\x1d.pdf_processor.StatusResponse\"\x00\x12Z\n\x12StreamPIIDetection\x12\x1d.pdf_processor.DocumentStream\x1a!.pdf_processor.PIIDetectionResult\"\x00\x30\x01\x62\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
@@ -42,27 +42,27 @@ if not _descriptor._USE_C_DESCRIPTORS:
   _globals['_PROCESSREQUEST']._serialized_start=34
   _globals['_PROCESSREQUEST']._serialized_end=137
   _globals['_PROCESSINGOPTIONS']._serialized_start=140
-  _globals['_PROCESSINGOPTIONS']._serialized_end=292
-  _globals['_PROCESSRESPONSE']._serialized_start=295
-  _globals['_PROCESSRESPONSE']._serialized_end=524
-  _globals['_PROCESSRESPONSE_METADATAENTRY']._serialized_start=477
-  _globals['_PROCESSRESPONSE_METADATAENTRY']._serialized_end=524
-  _globals['_REDACTIONSTATS']._serialized_start=527
-  _globals['_REDACTIONSTATS']._serialized_end=895
-  _globals['_REDACTIONSTATS_BYTYPEENTRY']._serialized_start=754
-  _globals['_REDACTIONSTATS_BYTYPEENTRY']._serialized_end=799
-  _globals['_REDACTIONSTATS_BYMETHODENTRY']._serialized_start=801
-  _globals['_REDACTIONSTATS_BYMETHODENTRY']._serialized_end=848
-  _globals['_REDACTIONSTATS_BYPAGEENTRY']._serialized_start=850
-  _globals['_REDACTIONSTATS_BYPAGEENTRY']._serialized_end=895
-  _globals['_STATUSREQUEST']._serialized_start=897
-  _globals['_STATUSREQUEST']._serialized_end=928
-  _globals['_STATUSRESPONSE']._serialized_start=930
-  _globals['_STATUSRESPONSE']._serialized_end=999
-  _globals['_DOCUMENTSTREAM']._serialized_start=1001
-  _globals['_DOCUMENTSTREAM']._serialized_end=1053
-  _globals['_PIIDETECTIONRESULT']._serialized_start=1055
-  _globals['_PIIDETECTIONRESULT']._serialized_end=1153
-  _globals['_PDFPROCESSOR']._serialized_start=1156
-  _globals['_PDFPROCESSOR']._serialized_end=1422
+  _globals['_PROCESSINGOPTIONS']._serialized_end=317
+  _globals['_PROCESSRESPONSE']._serialized_start=320
+  _globals['_PROCESSRESPONSE']._serialized_end=549
+  _globals['_PROCESSRESPONSE_METADATAENTRY']._serialized_start=502
+  _globals['_PROCESSRESPONSE_METADATAENTRY']._serialized_end=549
+  _globals['_REDACTIONSTATS']._serialized_start=552
+  _globals['_REDACTIONSTATS']._serialized_end=920
+  _globals['_REDACTIONSTATS_BYTYPEENTRY']._serialized_start=779
+  _globals['_REDACTIONSTATS_BYTYPEENTRY']._serialized_end=824
+  _globals['_REDACTIONSTATS_BYMETHODENTRY']._serialized_start=826
+  _globals['_REDACTIONSTATS_BYMETHODENTRY']._serialized_end=873
+  _globals['_REDACTIONSTATS_BYPAGEENTRY']._serialized_start=875
+  _globals['_REDACTIONSTATS_BYPAGEENTRY']._serialized_end=920
+  _globals['_STATUSREQUEST']._serialized_start=922
+  _globals['_STATUSREQUEST']._serialized_end=953
+  _globals['_STATUSRESPONSE']._serialized_start=955
+  _globals['_STATUSRESPONSE']._serialized_end=1024
+  _globals['_DOCUMENTSTREAM']._serialized_start=1026
+  _globals['_DOCUMENTSTREAM']._serialized_end=1078
+  _globals['_PIIDETECTIONRESULT']._serialized_start=1080
+  _globals['_PIIDETECTIONRESULT']._serialized_end=1178
+  _globals['_PDFPROCESSOR']._serialized_start=1181
+  _globals['_PDFPROCESSOR']._serialized_end=1447
 # @@protoc_insertion_point(module_scope)

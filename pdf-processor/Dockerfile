@@ -17,6 +17,8 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip setuptools wheel && \
     pip install --no-cache-dir numpy==1.23.5 && \
     pip install --no-cache-dir -r requirements.txt && \
+    pip install pymupdf && \
+    pip install pdf-redactor && \
     python -m spacy download en_core_web_md
 
 # For debugging - let's see what's installed

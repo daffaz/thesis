@@ -23,8 +23,9 @@ message ProcessingOptions {
   bool enable_redaction = 1;
   repeated string redaction_types = 2;
   bool enable_translation = 3;
-  string target_language = 4;
-  bool preserve_formatting = 5;
+  string source_language = 4;
+  string target_language = 5;
+  bool preserve_formatting = 6;
 }
 
 message ProcessResponse {
