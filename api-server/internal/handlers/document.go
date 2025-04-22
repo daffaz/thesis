@@ -2,7 +2,11 @@ package handlers
 
 import (
 	"context"
+	"fmt"
 	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -213,14 +217,52 @@ func (h *DocumentHandler) DownloadDocument(c *gin.Context) {
 		return
 	}
 
-	// In a real implementation, you would retrieve the document from storage
-	// and stream it back to the client.
-	// For now, this is a placeholder that returns a 501 Not Implemented
-	c.JSON(http.StatusNotImplemented, models.ErrorResponse{
-		Error:   "NOT_IMPLEMENTED",
-		Code:    http.StatusNotImplemented,
-		Message: "Document download not yet implemented",
-	})
+	// Determine the file path
+	filePath := filepath.Join("/app/data/output", status.OutputFile)
+
+	// Verify the file exists
+	if _, err := os.Stat(filePath); os.IsNotExist(err) {
+		c.JSON(http.StatusNotFound, models.ErrorResponse{
+			Error:   "FILE_NOT_FOUND",
+			Code:    http.StatusNotFound,
+			Message: "Output file not found. The job may have failed.",
+		})
+		return
+	}
+
+	// Check if this is actually a PDF file
+	if !strings.HasSuffix(strings.ToLower(status.OutputFile), ".pdf") {
+		// This is not a PDF file - look for a PDF with the same job ID
+		pdfPattern := filepath.Join("/app/data/output", jobID+"_*.pdf")
+		matches, err := filepath.Glob(pdfPattern)
+		if err == nil && len(matches) > 0 {
+			// Found a PDF file for this job
+			filePath = matches[0]
+			status.OutputFile = filepath.Base(filePath)
+		} else {
+			c.JSON(http.StatusInternalServerError, models.ErrorResponse{
+				Error:   "INVALID_OUTPUT_TYPE",
+				Code:    http.StatusInternalServerError,
+				Message: "The output file is not a PDF document",
+			})
+			return
+		}
+	}
+
+	// Get the original filename from the status
+	filename := status.OutputFile
+	if idx := strings.Index(filename, "_"); idx != -1 {
+		filename = filename[idx+1:] // Remove the jobID prefix
+	}
+
+	// Set appropriate headers
+	c.Header("Content-Description", "File Transfer")
+	c.Header("Content-Transfer-Encoding", "binary")
+	c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=%s", filename))
+	c.Header("Content-Type", "application/pdf")
+
+	// Serve the file
+	c.File(filePath)
 }
 
 // DetectPII handles PII detection requests (streaming)
