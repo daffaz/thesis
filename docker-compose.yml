@@ -30,12 +30,15 @@ services:
     volumes:
       - ./pdf-processor/src:/app/src
       - ./data:/app/data
+      - ./models:/app/models  # Add volume for translation models
     ports:
       - "50051:50051"
     environment:
       - LOG_LEVEL=INFO
       - ENABLE_PII_DETECTION=true
       - ENABLE_OCR=true
+      - TRANSLATION_MODEL_PATH=/app/models/nllb-200-distilled-600M  # Path to local model
+
     restart: unless-stopped
 
   # This will be added later when you implement full document storage

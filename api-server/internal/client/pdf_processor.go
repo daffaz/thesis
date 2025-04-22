@@ -8,6 +8,7 @@ import (
 	"log"
 	"time"
 
+	"server_pdf_processor/internal/models"
 	"server_pdf_processor/pkg/pdf/pdf_processor/proto"
 
 	"google.golang.org/grpc"
@@ -26,6 +27,7 @@ type PDFProcessingOptions struct {
 	RedactionTypes     []string
 	EnableTranslation  bool
 	TargetLanguage     string
+	SourceLanguage     string
 	PreserveFormatting bool
 }
 
@@ -85,58 +87,65 @@ func (c *PDFProcessorClient) Close() error {
 }
 
 // ProcessDocument sends a document for processing
-func (c *PDFProcessorClient) ProcessDocument(
-	ctx context.Context,
-	documentReader io.Reader,
-	filename string,
-	options PDFProcessingOptions,
-) (*ProcessingResult, error) {
-	// Read the document data
-	documentData, err := ioutil.ReadAll(documentReader)
+func (c *PDFProcessorClient) ProcessDocument(ctx context.Context, file io.Reader, filename string, options PDFProcessingOptions) (*models.ProcessingResponse, error) {
+	// Read the file content
+	fileContent, err := io.ReadAll(file)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read document: %v", err)
+		return nil, fmt.Errorf("failed to read file: %w", err)
 	}
 
-	// Create processing options
-	processingOptions := &pdf_processor.ProcessingOptions{
-		EnableRedaction:    options.EnableRedaction,
-		RedactionTypes:     options.RedactionTypes,
-		EnableTranslation:  options.EnableTranslation,
-		TargetLanguage:     options.TargetLanguage,
-		PreserveFormatting: options.PreserveFormatting,
-	}
-
-	// Prepare the request
+	// Create the gRPC request
 	req := &pdf_processor.ProcessRequest{
-		Document: documentData,
+		Document: fileContent,
 		Filename: filename,
-		Options:  processingOptions,
+		Options: &pdf_processor.ProcessingOptions{
+			EnableRedaction:    options.EnableRedaction,
+			RedactionTypes:     options.RedactionTypes,
+			EnableTranslation:  options.EnableTranslation,
+			SourceLanguage:     options.SourceLanguage,
+			TargetLanguage:     options.TargetLanguage,
+			PreserveFormatting: options.PreserveFormatting,
+		},
 	}
 
-	// Set a timeout for the request
-	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-
-	// Send the request to the server
+	// Call the gRPC service
 	resp, err := c.client.ProcessDocument(ctx, req)
 	if err != nil {
-		return nil, fmt.Errorf("error processing document: %v", err)
+		return nil, fmt.Errorf("gRPC call failed: %w", err)
 	}
 
-	// Map the response to our internal model
-	result := &ProcessingResult{
+	// Map the response to our model
+	result := &models.ProcessingResponse{
 		JobID:            resp.JobId,
 		OriginalFilename: resp.OriginalFilename,
-		Metadata:         resp.Metadata,
+		Status:           "processing",
+		Metadata:         make(map[string]string),
 	}
 
-	// Map redaction stats if present
+	// Copy metadata
+	for k, v := range resp.Metadata {
+		result.Metadata[k] = v
+	}
+
+	// Map redaction stats if available
 	if resp.RedactionStats != nil {
-		result.RedactionStats = &RedactionStats{
+		result.RedactionStats = &models.RedactionStats{
 			TotalPIICount: resp.RedactionStats.TotalPiiCount,
-			ByType:        resp.RedactionStats.ByType,
-			ByMethod:      resp.RedactionStats.ByMethod,
-			ByPage:        resp.RedactionStats.ByPage,
+			ByType:        make(map[string]int64),
+			ByMethod:      make(map[string]int64),
+			ByPage:        make(map[string]int64),
+		}
+
+		for k, v := range resp.RedactionStats.ByType {
+			result.RedactionStats.ByType[k] = v
+		}
+
+		for k, v := range resp.RedactionStats.ByMethod {
+			result.RedactionStats.ByMethod[k] = v
+		}
+
+		for k, v := range resp.RedactionStats.ByPage {
+			result.RedactionStats.ByPage[k] = v
 		}
 	}
 

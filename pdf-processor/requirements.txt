@@ -6,6 +6,12 @@ pdfminer.six==20221105
 spacy==3.6.1
 regex==2023.8.8
 
+# Translation dependencies
+transformers>=4.29.0
+torch>=2.0.0
+langdetect>=1.0.9
+sentencepiece>=0.1.99
+
 # gRPC dependencies
 grpcio>=1.71.0
 grpcio-tools>=1.71.0

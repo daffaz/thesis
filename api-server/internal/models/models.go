@@ -5,6 +5,7 @@ type ProcessingOptions struct {
 	EnableRedaction    bool     `json:"enable_redaction"`
 	RedactionTypes     []string `json:"redaction_types,omitempty"`
 	EnableTranslation  bool     `json:"enable_translation"`
+	SourceLanguage     string   `json:"source_language,omitempty"`
 	TargetLanguage     string   `json:"target_language,omitempty"`
 	PreserveFormatting bool     `json:"preserve_formatting"`
 }

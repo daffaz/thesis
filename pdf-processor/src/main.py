@@ -77,6 +77,39 @@ class PDFProcessorServicer(pdf_processor_pb2_grpc.PDFProcessorServicer):
                     # Convert non-string values to strings
                     response.metadata[key] = str(value)
 
+            # Apply translation if requested
+            if request.options.enable_translation:
+                source_language = request.options.source_language if request.options.source_language else None
+                target_language = request.options.target_language
+
+                if not target_language:
+                    context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
+                    context.set_details("Target language is required for translation")
+                    return pdf_processor_pb2.ProcessResponse()
+
+                logger.info(f"Translating document from {source_language or 'auto-detected'} to {target_language}")
+
+                # Initialize translation service if not already initialized
+                if not hasattr(self, 'translation_service'):
+                    self.translation_service = TranslationService()
+
+                # Translate the document
+                document = self.translation_service.translate_document(
+                    document,
+                    source_language,
+                    target_language
+                )
+
+                # Add translation metadata
+                response.metadata["translated"] = "true"
+                response.metadata["target_language"] = target_language
+                if source_language:
+                    response.metadata["source_language"] = source_language
+
+                # Modify the output filename to indicate translation
+                output_lang_suffix = target_language.split('_')[0] if '_' in target_language else target_language
+                output_file_path = OUTPUT_DIR / f"{job_id}_{output_lang_suffix}_{request.filename}"
+
             # Apply PII redaction if requested
             if request.options.enable_redaction:
                 # Determine what to redact
@@ -91,25 +124,44 @@ class PDFProcessorServicer(pdf_processor_pb2_grpc.PDFProcessorServicer):
 
                 # If there are items to redact, try to apply them to the PDF
                 if redacted_items:
-                    # Try redaction with PyMuPDF first (more robust)
-                    logger.info("Attempting redaction with PyMuPDF (primary method)")
-                    pymupdf_success = self.redact_pdf_with_pymupdf(str(input_file_path), str(output_file_path), redacted_items)
+                    # For translation + redaction, we need to create a new PDF
+                    # This is a simplification - in a real implementation you'd render a PDF from the translated text
 
-                    # If PyMuPDF fails, try with pdf-redactor
-                    if not pymupdf_success:
-                        logger.warning("PyMuPDF redaction failed, trying pdf-redactor as fallback")
-                        pdf_redactor_success = self.redact_pdf_with_pdf_redactor(str(input_file_path), str(output_file_path), redacted_items)
-                        redaction_success = pdf_redactor_success
+                    if request.options.enable_translation:
+                        # For translation + redaction, we need to create a new PDF from scratch
+                        # with the translated and redacted content
+                        redaction_success = self._create_translated_pdf(
+                            redacted_document,
+                            str(output_file_path)
+                        )
                     else:
-                        redaction_success = True
+                        # Standard redaction (no translation)
+                        # Try redaction with PyMuPDF first (more robust)
+                        logger.info("Attempting redaction with PyMuPDF (primary method)")
+                        pymupdf_success = self.redact_pdf_with_pymupdf(str(input_file_path), str(output_file_path), redacted_items)
+
+                        # If PyMuPDF fails, try with pdf-redactor
+                        if not pymupdf_success:
+                            logger.warning("PyMuPDF redaction failed, trying pdf-redactor as fallback")
+                            pdf_redactor_success = self.redact_pdf_with_pdf_redactor(str(input_file_path), str(output_file_path), redacted_items)
+                            redaction_success = pdf_redactor_success
+                        else:
+                            redaction_success = True
                 else:
                     # No items to redact
                     logger.info("No PII found to redact")
                     redaction_success = True  # We consider this a success case (nothing to redact)
 
-                    # Just copy the original file as output
-                    with open(input_file_path, "rb") as src, open(output_file_path, "wb") as dst:
-                        dst.write(src.read())
+                    if request.options.enable_translation:
+                        # For translation without redaction, create a new PDF from the translated content
+                        redaction_success = self._create_translated_pdf(
+                            document,
+                            str(output_file_path)
+                        )
+                    else:
+                        # Just copy the original file as output
+                        with open(input_file_path, "rb") as src, open(output_file_path, "wb") as dst:
+                            dst.write(src.read())
 
                 # Get redaction statistics
                 stats = self.pii_detector.get_pii_statistics(document, redaction_types)
@@ -118,9 +170,6 @@ class PDFProcessorServicer(pdf_processor_pb2_grpc.PDFProcessorServicer):
                 redaction_stats = pdf_processor_pb2.RedactionStats(
                     total_pii_count=stats['total_pii_count']
                 )
-
-                # REMOVED: Log file generation
-                # We don't create PII log files anymore
 
                 # If redaction fails, provide a clear error marker
                 if not redaction_success and len(redacted_items) > 0:
@@ -155,11 +204,23 @@ class PDFProcessorServicer(pdf_processor_pb2_grpc.PDFProcessorServicer):
 
                 response.redaction_stats.CopyFrom(redaction_stats)
             else:
-                # If no redaction requested, just copy the file to output
-                with open(input_file_path, "rb") as src, open(output_file_path, "wb") as dst:
-                    dst.write(src.read())
+                # Handle translation-only case (no redaction)
+                if request.options.enable_translation:
+                    # Create a new PDF with the translated content
+                    success = self._create_translated_pdf(
+                        document,
+                        str(output_file_path)
+                    )
 
-            # Note: Translation would be implemented here
+                    if not success:
+                        logger.error("Failed to create translated PDF")
+                        context.set_code(grpc.StatusCode.INTERNAL)
+                        context.set_details("Failed to create translated PDF")
+                        return pdf_processor_pb2.ProcessResponse()
+                else:
+                    # If no processing requested, just copy the file to output
+                    with open(input_file_path, "rb") as src, open(output_file_path, "wb") as dst:
+                        dst.write(src.read())
 
             logger.info(f"Successfully processed job {job_id}")
             return response
@@ -171,6 +232,66 @@ class PDFProcessorServicer(pdf_processor_pb2_grpc.PDFProcessorServicer):
             context.set_code(grpc.StatusCode.INTERNAL)
             context.set_details(f"Error processing document: {str(e)}")
             return pdf_processor_pb2.ProcessResponse()
+
+    def _create_translated_pdf(self, document, output_path):
+        """
+        Create a new PDF document from translated text
+
+        Args:
+            document: Document dictionary with translated text
+            output_path: Path where to save the output PDF
+
+        Returns:
+            Boolean indicating success
+        """
+        try:
+            import fitz  # PyMuPDF
+
+            logger.info(f"Creating new PDF with translated content at {output_path}")
+
+            # Create a new PDF document
+            doc = fitz.open()
+
+            # Process each page
+            for page_num in sorted(document.keys()):
+                page_content = document[page_num]
+
+                # Add a new page
+                page = doc.new_page()
+
+                # Simple rendering - using just the main text
+                # In a production system, you'd want to preserve formatting better
+                if 'text' in page_content and page_content['text']:
+                    text = page_content['text']
+
+                    # Create a text block that fits on the page
+                    rect = fitz.Rect(50, 50, page.rect.width - 50, page.rect.height - 50)
+                    page.insert_text(
+                        fitz.Point(50, 50),  # Starting position
+                        text,
+                        fontname="helv",  # A standard font
+                        fontsize=11,
+                        rect=rect
+                    )
+
+                # For a more sophisticated implementation, you could:
+                # 1. Use paragraphs to better format the text
+                # 2. Render tables as actual tables
+                # 3. Preserve images from the original document
+
+            # Save the document
+            doc.save(output_path)
+            doc.close()
+
+            logger.info(f"Successfully created translated PDF at {output_path}")
+            return True
+
+        except Exception as e:
+            logger.error(f"Error creating translated PDF: {str(e)}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return False
+
 
     def redact_pdf_with_pdf_redactor(self, input_path, output_path, redacted_items):
         """Apply redactions to a PDF file using pdf-redactor library"""
