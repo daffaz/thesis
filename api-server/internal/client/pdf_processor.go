@@ -131,9 +131,9 @@ func (c *PDFProcessorClient) ProcessDocument(ctx context.Context, file io.Reader
 	if resp.RedactionStats != nil {
 		result.RedactionStats = &models.RedactionStats{
 			TotalPIICount: resp.RedactionStats.TotalPiiCount,
-			ByType:        make(map[string]int64),
-			ByMethod:      make(map[string]int64),
-			ByPage:        make(map[string]int64),
+			ByType:        make(map[string]int32),
+			ByMethod:      make(map[string]int32),
+			ByPage:        make(map[string]int32),
 		}
 
 		for k, v := range resp.RedactionStats.ByType {
