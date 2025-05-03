@@ -765,6 +765,12 @@ class PDFProcessorServicer(pdf_processor_pb2_grpc.PDFProcessorServicer):
 
             logger.info(f"Processing redactions across {len(redactions_by_page)} pages")
 
+            cc_items = [item for item in redacted_items if 'type' in item and item['type'] == 'credit_card']
+            logger.info(f"Found {len(cc_items)} credit card items to redact")
+        
+            for item in cc_items:
+                logger.info(f"Credit card to redact: {item}")
+
             # Process each page
             for page_num, items in redactions_by_page.items():
                 try:
@@ -812,6 +818,17 @@ class PDFProcessorServicer(pdf_processor_pb2_grpc.PDFProcessorServicer):
                     # Apply the redactions to this page
                     page.apply_redactions()
                     logger.info(f"Applied redactions to page {page_num}")
+
+                    # TODO REMOVE LATER
+                    cc_items_for_page = [item for item in items if 'type' in item and item['type'] == 'credit_card']
+                    if cc_items_for_page:
+                        logger.info(f"Processing {len(cc_items_for_page)} credit card redactions on page {page_num}")
+                        
+                        # After text search for each credit card
+                        for item in cc_items_for_page:
+                            text_to_find = item["original"]
+                            text_instances = page.search_for(text_to_find)
+                            logger.info(f"Credit card search results: {text_instances} for text: {text_to_find}")
 
                 except Exception as e:
                     logger.error(f"Error processing page {page_num}: {str(e)}")
@@ -1012,6 +1029,22 @@ class PDFProcessorServicer(pdf_processor_pb2_grpc.PDFProcessorServicer):
                 # Process each page
                 for page_num, page_content in document.items():
                     if 'text' in page_content:
+                        # TODO REMOVE LATER
+                        logger.info(f"Page {page_num} full text: {page_content['text']}")
+
+                        # TODO REMOVE LATER ALSO
+                        patterns = [
+                            r'\d{4}[-]\d{4}[-]\d{4}[-]\d{4}',  # Dashes
+                            r'\d{4}\s\d{4}\s\d{4}\s\d{4}',     # Spaces
+                            r'\d{16}',                          # No separators
+                            r'\d{4}.?\d{4}.?\d{4}.?\d{4}'       # Any separator
+                        ]
+                        
+                        for i, pattern in enumerate(patterns):
+                            matches = re.findall(pattern, page_content['text'])
+                            if matches:
+                                logger.info(f"Page {page_num} - Found potential credit card with pattern {i}: {matches}")
+
                         # For large pages, process in chunks
                         if len(page_content['text']) > 50000:  # ~10 pages of text
                             logger.info(f"Processing large page {page_num} in chunks")

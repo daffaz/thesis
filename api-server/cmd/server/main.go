@@ -10,11 +10,12 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/gin-gonic/gin"
 	"server_pdf_processor/internal/client"
 	"server_pdf_processor/internal/config"
 	"server_pdf_processor/internal/handlers"
 	"server_pdf_processor/internal/middleware"
+
+	"github.com/gin-gonic/gin"
 )
 
 // Version information

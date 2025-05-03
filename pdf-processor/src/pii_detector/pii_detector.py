@@ -39,7 +39,7 @@ class PIIDetector:
             'email': re.compile(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'),
             'phone': re.compile(r'\b(?:\+\d{1,3}[- ]?)?\(?\d{3}\)?[- ]?\d{3}[- ]?\d{4}\b'),
             'ssn': re.compile(r'\b\d{3}[-]?\d{2}[-]?\d{4}\b'),
-            'credit_card': re.compile( r'(?:\d{4}[-\s]?){3}\d{4}|(?:\d{4}[\s-]?){3}\d{4}'),
+            'credit_card': re.compile(r'\b(?:\d{4}[-\s.]?){3}\d{4}\b|\b\d{16}\b|\b\d{4}[-\s]?\d{4}[-\s]?\d{4}[-\s]?\d{4}\b',),
             'ip_address': re.compile(r'\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b'),
             'date_of_birth': re.compile(r'\b(0[1-9]|1[0-2])[-/](0[1-9]|[12]\d|3[01])[-/](19|20)\d{2}\b')
         }
@@ -63,7 +63,8 @@ class PIIDetector:
         # Name-related context indicators for verification
         self.name_indicators = [
             "name:", "nama:", "full name:", "by:", "from:", "to:",
-            "sincerely,", "regards,", "signed by", "signature"
+            "sincerely,", "regards,", "signed by", "signature",
+            "mr.", "mrs.", "ms.", "dr.", "prof."
         ]
         
         # Additional title prefixes to improve name detection
@@ -109,13 +110,27 @@ class PIIDetector:
 
         # Determine which PII types to detect
         ner_types_to_include, regex_types_to_include = self._resolve_pii_types(pii_types)
-        
+        logger = logging.getLogger(__name__)
+        logger.info(f"Starting regex detection for types: {regex_types_to_include}")
+
         # Check if this is a large text that should be chunked
         if len(text) > self.chunk_size:
             return self.detect_pii_in_chunks(text, pii_types)
             
         # Process the text
-        return self._process_text(text, ner_types_to_include, regex_types_to_include)
+        pii_instances = self._process_text(text, ner_types_to_include, regex_types_to_include)
+        
+        # Special handling for credit cards - try to detect fragments if no credit cards found
+        if 'credit_card' in regex_types_to_include:
+            credit_card_found = any(item['type'] == 'credit_card' for item in pii_instances)
+            if not credit_card_found:
+                # Try to detect and reassemble credit card fragments
+                credit_card_fragments = self.detect_credit_card_fragments(text)
+                if credit_card_fragments:
+                    logger.info(f"Successfully reassembled {len(credit_card_fragments)} credit cards from fragments")
+                    pii_instances.extend(credit_card_fragments)
+        
+        return pii_instances
         
     def _resolve_pii_types(self, pii_types: Optional[List[str]]) -> Tuple[List[str], List[str]]:
         """
@@ -188,7 +203,19 @@ class PIIDetector:
             if regex_types_to_include:
                 for pii_type, pattern in self.regex_patterns.items():
                     if pii_type in regex_types_to_include:
+                        logger.info(f"Searching for {pii_type} with pattern: {pattern}")
+                        matches = list(re.finditer(pattern, text))
+                        logger.info(f"Found {len(matches)} matches for {pii_type}")
+                        
+                        if pii_type == 'credit_card' and not matches:
+                            # Look for any digit sequences that might be credit cards
+                            digit_seqs = re.findall(r'\d{4,}', text)
+                            if digit_seqs:
+                                logger.info(f"Found digit sequences that might be parts of CC: {digit_seqs[:10]}")
+
                         for match in pattern.finditer(text):
+                            found_text = match.group()
+                            logger.info(f"Found {pii_type}: {found_text[:4]}...{found_text[-4:]} at position {match.start()}-{match.end()}")
                             pii_instances.append({
                                 'text': match.group(),
                                 'start': match.start(),
@@ -206,7 +233,8 @@ class PIIDetector:
         except Exception as e:
             logger.error(f"Error in detect_pii: {str(e)}")
             return []
-            
+        
+    
     def detect_pii_in_chunks(self, text: str, pii_types: Optional[List[str]] = None, 
                          overlap: int = 200) -> List[Dict]:
         """
@@ -295,7 +323,7 @@ class PIIDetector:
 
     def _verify_person_entity(self, entity, text: str) -> bool:
         """
-        Enhanced verification for PERSON entities to reduce false positives.
+        Apply additional verification for PERSON entities to reduce false positives.
 
         Args:
             entity: spaCy entity to verify
@@ -304,15 +332,25 @@ class PIIDetector:
         Returns:
             Boolean indicating if this should be treated as PII
         """
-        entity_text = entity.text.strip()
+        entity_text = entity.text
 
         # Skip very short entities - likely false positives
-        if len(entity_text) < 3:
+        if len(entity_text.strip()) < 4:  # Increase threshold from 3 to 4
             return False
             
-        # Skip single-word lowercase entities - likely not names
-        if len(entity_text.split()) == 1 and entity_text[0].islower():
+        # Skip single words that are common in Latin text 
+        common_latin_words = ["sed", "et", "duis", "sunt", "esse", "ipsum", "amet", "elit", "sit"]
+        if entity_text.lower() in common_latin_words:
             return False
+
+        # Check capitalization - names should be capitalized
+        if not entity_text[0].isupper():
+            return False
+            
+        # If all words are capitalized (title case), it's more likely to be a name
+        words = entity_text.split()
+        if len(words) >= 2 and all(word[0].isupper() for word in words if word):
+            return True
 
         # Get surrounding context
         context_start = max(0, entity.start_char - 50)
@@ -323,35 +361,6 @@ class PIIDetector:
         for indicator in self.name_indicators:
             if indicator in surrounding:
                 return True
-
-        # Check capitalization pattern - names are typically capitalized
-        words = entity_text.split()
-        if len(words) >= 2 and all(word[0].isupper() for word in words if word):
-            return True
-            
-        # Check for title prefixes
-        for title in self.title_prefixes:
-            prefix_with_space = title + " "
-            if prefix_with_space + entity_text in text or prefix_with_space + entity_text.lower() in text.lower():
-                return True
-
-        # Check token part-of-speech tags - names are typically proper nouns
-        if all(token.pos_ == "PROPN" for token in entity):
-            return True
-            
-        # Check if entity is part of a larger name pattern
-        # Example: "John and Mary Smith" - both should be detected as names
-        is_name_pattern = False
-        for token in entity.doc:
-            if token.text.lower() in ["and", "&"] and token.i > 0 and token.i < len(entity.doc) - 1:
-                prev_token = entity.doc[token.i - 1]
-                next_token = entity.doc[token.i + 1]
-                if (prev_token.ent_type_ == "PERSON" or next_token.ent_type_ == "PERSON"):
-                    is_name_pattern = True
-                    break
-                    
-        if is_name_pattern:
-            return True
 
         # If no strong evidence it's a name, assume it's not PII
         return False
@@ -377,11 +386,16 @@ class PIIDetector:
         seen = set()  # Track combinations of text and type
         
         # First pass: remove exact text+type duplicates
+        pii_by_type = {}
         for item in pii_instances:
+            pii_type = item['type']
+            pii_by_type[pii_type] = pii_by_type.get(pii_type, 0) + 1    
             key = (item.get('text', ''), item.get('type', ''))
             if key not in seen:
                 seen.add(key)
                 unique_instances.append(item)
+        
+        logger.info(f"PII types found: {pii_by_type}")
                 
         # Second pass: remove overlapping entities
         filtered_instances = []
@@ -424,12 +438,17 @@ class PIIDetector:
         # Detect PII with the specified types
         pii_instances = self.detect_pii(text, pii_types)
 
+        logger = logging.getLogger(__name__)
+        logger.info(f"Detected {len(pii_instances)} PII instances to redact")
+
         # Make a copy of the original text
         redacted_text = text
 
         # Apply redactions from end to beginning to avoid offset issues
         redacted_items = []
         for item in sorted(pii_instances, key=lambda x: x['start'], reverse=True):
+            # TODO REMOVE THIS LATER
+            logger.info(f"Redacting {item['type']}: {item['text'][:4]}...{item['text'][-4:]} at position {item['start']}-{item['end']}")
             # Get the length of the PII text
             pii_length = item['end'] - item['start']
 
@@ -514,6 +533,116 @@ class PIIDetector:
 
         return redacted_document, unique_redacted_items
         
+    def detect_credit_card_fragments(self, text: str) -> List[Dict]:
+        """
+        Detect credit card fragments and attempt to reassemble them
+        
+        Args:
+            text: Text to analyze
+            
+        Returns:
+            List of detected credit card instances
+        """
+        logger = logging.getLogger(__name__)
+        results = []
+        
+        # Look for sequences of 4 digits with optional separators
+        # The pattern matches both fragments and complete card numbers
+        fragments = re.findall(r'\b\d{4}\b', text)
+        complete_cards = re.findall(r'\b\d{4}[- ]?\d{4}[- ]?\d{4}[- ]?\d{4}\b', text)
+        
+        # Log any complete cards found directly
+        if complete_cards:
+            logger.info(f"Found {len(complete_cards)} complete credit cards directly: {complete_cards}")
+            for card in complete_cards:
+                pos = text.find(card)
+                if pos >= 0:
+                    results.append({
+                        'text': card,
+                        'start': pos,
+                        'end': pos + len(card),
+                        'type': 'credit_card',
+                        'method': 'direct_match'
+                    })
+        
+        # Now try to reassemble fragments
+        logger.info(f"Found {len(fragments)} potential credit card fragments: {fragments}")
+        
+        # Create sliding window of 4 fragments
+        for i in range(len(fragments) - 3):
+            # Look for 4 consecutive fragments that could form a card
+            potential_fragments = fragments[i:i+4]
+            
+            # Check if these fragments look sequential
+            reassembled = '-'.join(potential_fragments)
+            
+            # Log potential reassembly
+            logger.info(f"Potential reassembled credit card: {reassembled}")
+            
+            # Don't validate too strictly - if it has 16 digits, treat it as a potential card
+            digits_only = ''.join(potential_fragments)
+            if len(digits_only) == 16:
+                pos = text.find(potential_fragments[0])
+                if pos >= 0:
+                    # Get an approximation of where the last fragment ends
+                    last_pos = text.find(potential_fragments[3], pos)
+                    if last_pos >= 0:
+                        end_pos = last_pos + len(potential_fragments[3])
+                        
+                        results.append({
+                            'text': reassembled,
+                            'start': pos,
+                            'end': end_pos,
+                            'type': 'credit_card',
+                            'method': 'fragment_reassembly'
+                        })
+                        logger.info(f"Successfully reassembled credit card: {reassembled}")
+        
+        # Also check for number sequences that look like credit cards without separators
+        # This catches cases where the PDF extraction removes the separators
+        unseparated = re.findall(r'\b\d{16}\b', text)
+        if unseparated:
+            logger.info(f"Found {len(unseparated)} unseparated 16-digit numbers: {unseparated}")
+            for card in unseparated:
+                pos = text.find(card)
+                if pos >= 0:
+                    # Format with dashes for better readability
+                    formatted = f"{card[0:4]}-{card[4:8]}-{card[8:12]}-{card[12:16]}"
+                    results.append({
+                        'text': formatted,
+                        'start': pos,
+                        'end': pos + len(card),
+                        'type': 'credit_card',
+                        'method': 'unseparated'
+                    })
+                    logger.info(f"Detected unseparated credit card: {card} -> {formatted}")
+        
+        return results
+
+    def _is_valid_credit_card(self, card_number: str) -> bool:
+        """
+        Basic validation for a credit card number
+        
+        Args:
+            card_number: Credit card number with or without separators
+            
+        Returns:
+            Boolean indicating if it looks like a valid card
+        """
+        # Remove separators
+        digits = re.sub(r'[^0-9]', '', card_number)
+        
+        # Check length
+        if len(digits) != 16:
+            return False
+        
+        # Check starting digit (simple check)
+        valid_starts = ['4', '5', '3', '6']  # Visa, MC, Amex, Discover
+        if digits[0] not in valid_starts:
+            return False
+        
+        return True
+    
     def _redact_page(self, page_content: Dict, page_num: int, pii_types: Optional[List[str]]) -> Tuple[Dict, List[Dict]]:
         """
         Redact PII from a single page.

@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
@@ -76,7 +77,8 @@ func (h *DocumentHandler) ProcessDocument(c *gin.Context) {
 	// Parse processing options
 	var options models.ProcessingOptions
 	if optionsStr := c.PostForm("options"); optionsStr != "" {
-		if err := c.ShouldBindJSON(&options); err != nil {
+		// Unmarshal the JSON string from the form field
+		if err := json.Unmarshal([]byte(optionsStr), &options); err != nil {
 			c.JSON(http.StatusBadRequest, models.ErrorResponse{
 				Error:   "INVALID_OPTIONS",
 				Code:    http.StatusBadRequest,
