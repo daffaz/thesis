@@ -19,6 +19,7 @@ import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from generated import processor_pb2 as pdf_processor_pb2
 from generated import processor_pb2_grpc as pdf_processor_pb2_grpc
+from src.pii_detector.pii_detector import PIIDetector
 
 # Configure logging
 logging.basicConfig(
@@ -210,7 +211,6 @@ class PDFProcessorServicer(pdf_processor_pb2_grpc.PDFProcessorServicer):
     def pii_detector(self):
         """Lazy load the PII detector"""
         if self._pii_detector is None:
-            from src.pii_detector.pii_detector import PIIDetector
             self._pii_detector = PIIDetector(
                 enable_multithreading=True
             )
@@ -287,49 +287,102 @@ class PDFProcessorServicer(pdf_processor_pb2_grpc.PDFProcessorServicer):
             context.set_code(grpc.StatusCode.INTERNAL)
             context.set_details(f"Error initiating document processing: {str(e)}")
             return pdf_processor_pb2.ProcessResponse()
-            
-    def _process_document_background(self, job_id, input_file_path, filename, options):
+
+    def detect_language(self, text: str) -> str:
         """
-        Process a document in the background with comprehensive error handling.
-        
+        Detect the language of the text.
+        Currently supports English and Indonesian.
+
         Args:
-            job_id: Unique job identifier
-            input_file_path: Path to the input PDF file
-            filename: Original filename
-            options: Processing options from the request
+            text: Text to analyze
+
+        Returns:
+            Language code ('en' or 'id')
         """
+        # Simple detection based on common Indonesian words
+        indonesian_words = [
+            "dan", "yang", "di", "ini", "dengan", "untuk", "tidak", "dalam",
+            "adalah", "pada", "akan", "dari", "telah", "oleh", "atau", "juga",
+            "ke", "karena", "tersebut", "bisa", "ada", "mereka", "lebih", "tahun",
+            "sudah", "saya", "kita", "seperti", "kami", "kepada", "hanya", "banyak",
+            "sebagai", "jalan", "nomor", "satu", "dua", "tiga", "empat", "lima"
+        ]
+
+        # Count Indonesian words in the text
+        text_lower = text.lower()
+        indonesian_word_count = sum(1 for word in indonesian_words if f" {word} " in f" {text_lower} ")
+
+        # If more than 5 Indonesian words found, consider it Indonesian
+        # This is a simple heuristic - consider using langdetect library for better results
+        if indonesian_word_count > 5:
+            return "id"
+        return "en"
+
+    def _process_document_background(self, job_id, input_file_path, filename, options):
+        """Process a document in the background with comprehensive error handling."""
         output_file_path = None
         try:
             logger.info(f"Starting background processing for job {job_id}")
             output_file_path = OUTPUT_DIR / f"{job_id}_{filename}"
-            
+
             # Extract text from PDF
             logger.info(f"Extracting text from {input_file_path}")
             document = self.pdf_extractor.extract_text(str(input_file_path))
-            
+
             # Get document metadata
             metadata = self.pdf_extractor.get_document_metadata(str(input_file_path))
-            
+
+            # Determine document language from first page text
+            first_page_text = ""
+            for page_num in sorted(document.keys()):
+                if 'text' in document[page_num] and document[page_num]['text']:
+                    first_page_text = document[page_num]['text']
+                    break
+
+            # Import the language detection function
+            from src.utils import detect_document_language
+
+            # Detect language
+            language = detect_document_language(first_page_text)
+            logger.info(f"Detected document language: {language}")
+
             # Update job with metadata
             self._job_manager.update_job(job_id, "processing", metadata={
                 "page_count": metadata.get('pages', 0),
-                "extraction_complete": "true"
+                "extraction_complete": "true",
+                "language": language
             })
-            
+
             # Create a copy of the original document for processing
             processed_document = document.copy()
-            
-            # Apply translation if requested
+
+            # Apply redaction if requested
+            redaction_stats = None
+            if options.enable_redaction:
+                # Create a language-appropriate PII detector
+                pii_detector = PIIDetector(language=language)
+
+                # Apply redaction with language-specific detection
+                redaction_stats = self._apply_redaction(
+                    job_id, processed_document, options, input_file_path,
+                    output_file_path, pii_detector, language=language
+                )
+
+            # Apply translation if requested (after the other changes)
             if options.enable_translation:
                 self._apply_translation(
                     job_id, processed_document, options, output_file_path
                 )
-            
+
             # Apply PII redaction if requested
             redaction_stats = None
             if options.enable_redaction:
+                # Create a language-specific PII detector
+                pii_detector = PIIDetector(language=language)
+
                 redaction_stats = self._apply_redaction(
-                    job_id, processed_document, options, input_file_path, output_file_path
+                    job_id, processed_document, options, input_file_path, output_file_path,
+                    pii_detector
                 )
             
             # If no processing was requested, just copy the file
@@ -437,39 +490,58 @@ class PDFProcessorServicer(pdf_processor_pb2_grpc.PDFProcessorServicer):
                 "translation_error": str(e)
             })
             return False
-            
-    def _apply_redaction(self, job_id, document, options, input_file_path, output_file_path):
+
+    def _apply_redaction(self, job_id, document, options, input_file_path, output_file_path, pii_detector=None, language="en"):
         """
         Apply PII redaction to the document with error handling and fallback strategies.
-        
+
         Args:
             job_id: Unique job identifier
             document: Document to redact
             options: Processing options
             input_file_path: Path to the input file
             output_file_path: Path where to save the output file
-            
+            pii_detector: Optional custom PII detector for language-specific detection
+
         Returns:
             RedactionStats if redaction was successful, None otherwise
         """
         # Check if redaction is enabled
         if not options.enable_redaction:
             return None
-            
+
         # Determine what to redact
         redaction_types = list(options.redaction_types) if options.redaction_types else None
-        
+
         # Update job status
         self._job_manager.update_job(job_id, "detecting_pii", metadata={
             "redaction_types": ",".join(redaction_types) if redaction_types else "all"
         })
-        
+
         try:
-            # Detect and redact PII in the text representation
-            redacted_document, redacted_items = self.pii_detector.redact_document(
+            # Use the provided PII detector or create a new one
+            detector = pii_detector or self.pii_detector
+
+            # For Indonesian documents, add special NIK detection
+            if language == "id":
+                # Find NIKs specifically in each page
+                for page_num, page_content in document.items():
+                    if 'text' in page_content and page_content['text']:
+                        names = pii_detector.detect_indonesian_names(page_content['text'])
+                        if names:
+                            logger.info(f"Detected {len(names)} Indonesian names on page {page_num}")
+
+                        nik_instances = detector.detect_nik_with_context(page_content['text'])
+                        if nik_instances:
+                            logger.info(f"Detected {len(nik_instances)} NIK instances on page {page_num}")
+                            # Record these for redaction
+                            # (this will be handled in the standard redaction process)
+
+            # Detect and redact PII in the document
+            redacted_document, redacted_items = detector.redact_document(
                 document, redaction_types
             )
-            
+
             logger.info(f"Detected {len(redacted_items)} items to redact for job {job_id}")
             
             # Update job status
@@ -739,10 +811,7 @@ class PDFProcessorServicer(pdf_processor_pb2_grpc.PDFProcessorServicer):
             return False
 
     def _redact_pdf_with_pymupdf(self, input_path, output_path, redacted_items):
-        """
-        Apply redactions to a PDF file using PyMuPDF (fitz) with improved
-        redaction accuracy and flexible fallbacks.
-        """
+        """Apply redactions to a PDF file with improved handling for different languages."""
         try:
             import fitz  # PyMuPDF
 
@@ -751,13 +820,12 @@ class PDFProcessorServicer(pdf_processor_pb2_grpc.PDFProcessorServicer):
             # Open the PDF
             doc = fitz.open(input_path)
 
-            # Track if we made any changes
-            redactions_applied = False
-
-            # Group redactions by page
+            # Group redactions by page and create redaction annotations
             redactions_by_page = {}
+
+            # Group by page
             for item in redacted_items:
-                if "page" in item and "original" in item:
+                if "page" in item:
                     page_num = item["page"]
                     if page_num not in redactions_by_page:
                         redactions_by_page[page_num] = []
@@ -765,13 +833,16 @@ class PDFProcessorServicer(pdf_processor_pb2_grpc.PDFProcessorServicer):
 
             logger.info(f"Processing redactions across {len(redactions_by_page)} pages")
 
-            cc_items = [item for item in redacted_items if 'type' in item and item['type'] == 'credit_card']
-            logger.info(f"Found {len(cc_items)} credit card items to redact")
-        
-            for item in cc_items:
-                logger.info(f"Credit card to redact: {item}")
+            # Log specific types for debugging
+            nik_items = [item for item in redacted_items if item.get('type') == 'nik']
+            phone_items = [item for item in redacted_items if item.get('type') == 'phone']
+            email_items = [item for item in redacted_items if item.get('type') == 'email']
 
-            # Process each page
+            logger.info(f"Found {len(nik_items)} NIK items to redact")
+            logger.info(f"Found {len(phone_items)} phone items to redact")
+            logger.info(f"Found {len(email_items)} email items to redact")
+
+            # Process redactions page by page
             for page_num, items in redactions_by_page.items():
                 try:
                     # Adjust for 0-based indexing in PyMuPDF
@@ -781,75 +852,84 @@ class PDFProcessorServicer(pdf_processor_pb2_grpc.PDFProcessorServicer):
                         continue
 
                     page = doc[page_idx]
-                    
-                    # Redaction approaches in order of preference
+
+                    # Use multiple approaches to redact each item
                     redaction_approaches = [
                         self._redact_with_exact_search,
                         self._redact_with_fuzzy_search,
-                        self._redact_with_block_scan,
-                        self._redact_with_page_dict_scan
+                        self._redact_with_text_instance_search,
+                        self._redact_with_block_scan
                     ]
-                    
-                    # Try each approach for the items on this page
+
                     for item in items:
-                        text_to_find = item["original"]
-                        
-                        # Skip very short strings
-                        if len(text_to_find.strip()) < 3:
-                            logger.warning(f"Skipping very short text for redaction: '{text_to_find}'")
+                        if 'original' not in item:
                             continue
-                            
-                        # Try each approach in order
+
+                        text_to_redact = item['original']
+
+                        # Try each approach
                         item_redacted = False
                         for approach in redaction_approaches:
                             try:
-                                approach_result = approach(page, text_to_find)
-                                if approach_result:
+                                if approach(page, text_to_redact):
                                     item_redacted = True
-                                    redactions_applied = True
                                     break
-                            except Exception as approach_error:
-                                logger.warning(f"Redaction approach failed: {str(approach_error)}")
+                            except Exception as e:
+                                logger.warning(f"Approach failed: {str(e)}")
                                 continue
-                                
-                        if not item_redacted:
-                            logger.warning(f"Could not redact '{text_to_find[:20]}...' with any approach")
 
-                    # Apply the redactions to this page
+                        if not item_redacted:
+                            logger.warning(f"Could not redact '{text_to_redact[:20]}...' with any approach")
+
+                    # Apply all redactions to this page
                     page.apply_redactions()
                     logger.info(f"Applied redactions to page {page_num}")
 
-                    # TODO REMOVE LATER
-                    cc_items_for_page = [item for item in items if 'type' in item and item['type'] == 'credit_card']
-                    if cc_items_for_page:
-                        logger.info(f"Processing {len(cc_items_for_page)} credit card redactions on page {page_num}")
-                        
-                        # After text search for each credit card
-                        for item in cc_items_for_page:
-                            text_to_find = item["original"]
-                            text_instances = page.search_for(text_to_find)
-                            logger.info(f"Credit card search results: {text_instances} for text: {text_to_find}")
-
                 except Exception as e:
                     logger.error(f"Error processing page {page_num}: {str(e)}")
-                    continue
 
-            # Save the document if any redactions were applied
-            if redactions_applied:
-                logger.info(f"Saving redacted document to {output_path}")
-                doc.save(output_path)
-                doc.close()
-                return True
-            else:
-                logger.warning("No redactions were applied to the document")
-                doc.close()
-                return False
+            # Save the redacted document
+            doc.save(output_path)
+            doc.close()
+            return True
 
         except Exception as e:
-            logger.error(f"Error redacting PDF with PyMuPDF: {str(e)}")
+            logger.error(f"Error in PDF redaction: {str(e)}")
             import traceback
             logger.error(traceback.format_exc())
             return False
+
+    def _redact_with_text_instance_search(self, page, text_to_redact):
+        """More aggressive text search for redaction."""
+        # Get all text instances from the page using get_text
+        page_text = page.get_text("text")
+
+        if text_to_redact in page_text:
+            # Text exists but may be broken up - search using character positions
+            text_instances = page.search_for(text_to_redact)
+
+            if not text_instances and len(text_to_redact) > 5:
+                # Try with partial matches for longer text
+                partial_text = text_to_redact[:len(text_to_redact)//2]
+                text_instances = page.search_for(partial_text)
+
+                if text_instances:
+                    # Expand the matches to cover potential full text
+                    expanded_instances = []
+                    for inst in text_instances:
+                        expanded = fitz.Rect(inst.x0, inst.y0,
+                                             inst.x0 + len(text_to_redact) * 8,  # approximate width
+                                             inst.y1)
+                        expanded_instances.append(expanded)
+                    text_instances = expanded_instances
+
+            # Add redaction annotations
+            for inst in text_instances:
+                redact_annot = page.add_redact_annot(inst, fill=(0, 0, 0))
+                if redact_annot:
+                    return True
+
+        return False
             
     def _redact_with_exact_search(self, page, text_to_find):
         """Try exact text search redaction"""
@@ -1040,11 +1120,6 @@ class PDFProcessorServicer(pdf_processor_pb2_grpc.PDFProcessorServicer):
                             r'\d{4}.?\d{4}.?\d{4}.?\d{4}'       # Any separator
                         ]
                         
-                        for i, pattern in enumerate(patterns):
-                            matches = re.findall(pattern, page_content['text'])
-                            if matches:
-                                logger.info(f"Page {page_num} - Found potential credit card with pattern {i}: {matches}")
-
                         # For large pages, process in chunks
                         if len(page_content['text']) > 50000:  # ~10 pages of text
                             logger.info(f"Processing large page {page_num} in chunks")

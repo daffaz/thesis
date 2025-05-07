@@ -14,16 +14,17 @@ class PIIDetector:
     Detects and redacts personally identifiable information (PII) from text
     using a combination of NER models and regex patterns with optimized performance.
     """
-    
-    def __init__(self, model_name: str = "en_core_web_md", chunk_size: int = 5000, 
-                 enable_multithreading: bool = True):
+
+    def __init__(self, model_name: str = "en_core_web_md", chunk_size: int = 5000,
+                 enable_multithreading: bool = True, language: str = "en"):
         """
         Initialize the PII detector with optimized loading and configuration.
-        
+
         Args:
             model_name: Name of the spaCy model to use
             chunk_size: Default size for text chunks when processing large documents
             enable_multithreading: Whether to use multithreading for large documents
+            language: Language code ('en' for English, 'id' for Indonesian)
         """
         # Load model lazily when needed
         self._nlp = None
@@ -31,58 +32,272 @@ class PIIDetector:
         self.redaction_marker = "***"  # Default redaction marker
         self.chunk_size = chunk_size
         self.enable_multithreading = enable_multithreading
-        self.max_workers = min(4, ( multiprocessing.cpu_count() or 1) * 2)
-        
-        # Set up regex patterns for common PII types not well-covered by NER
-        # Precompile regex patterns for better performance
+        self.max_workers = min(4, (multiprocessing.cpu_count() or 1) * 2)
+        self.language = language
+
+        # Set up regex patterns based on language
+        self._setup_regex_patterns()
+
+        # Set up non-PII terms to exclude
+        self._setup_non_pii_terms()
+
+        # Other initialization code...
+        logger.info(f"Initialized PIIDetector with model '{model_name}' for language '{language}' (lazy loading)")
+
+    def _setup_regex_patterns(self):
+        """Set up regex patterns for PII detection based on language"""
+        # Common patterns across languages
         self.regex_patterns = {
             'email': re.compile(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'),
-            'phone': re.compile(r'\b(?:\+\d{1,3}[- ]?)?\(?\d{3}\)?[- ]?\d{3}[- ]?\d{4}\b'),
-            'ssn': re.compile(r'\b\d{3}[-]?\d{2}[-]?\d{4}\b'),
-            'credit_card': re.compile(r'\b(?:\d{4}[-\s.]?){3}\d{4}\b|\b\d{16}\b|\b\d{4}[-\s]?\d{4}[-\s]?\d{4}[-\s]?\d{4}\b',),
             'ip_address': re.compile(r'\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b'),
-            'date_of_birth': re.compile(r'\b(0[1-9]|1[0-2])[-/](0[1-9]|[12]\d|3[01])[-/](19|20)\d{2}\b')
         }
 
-        # Define mapping between user-friendly PII type names and internal representations
+        if self.language == "id":
+            # Indonesian-specific patterns
+            self.regex_patterns.update({
+                # Enhanced phone pattern for Indonesian formats
+                'phone': re.compile(r'(?:\+62[\s\-]?\d{1,3}[\s\-]?\d{3,4}[\s\-]?\d{3,5})'  # Mobile format: +62-812-3456-7890
+                                    r'|(?:0\d{2,3}[\s\-]?\d{3,4}[\s\-]?\d{3,4})'  # Mobile format: 0812-3456-7890
+                                    r'|(?:\(\d{2,3}\)[\s\-]?\d{3,4}[\s\-]?\d{3,4})'),  # Landline format: (021) 5230-8765
+
+                # NIK pattern (various formats)
+                'nik': re.compile(r'\b\d{16}\b|\b\d{6}(?:19|20)\d{2}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01])\d{4}\b|\b\d{2}\.\d{2}\.\d{2}\.\d{2}\.\d{2}\.\d{2}\b'),
+
+                # NPWP pattern
+                'npwp': re.compile(r'\b\d{2}\.\d{3}\.\d{3}\.\d{1}-\d{3}\.\d{3}\b'),
+
+                # Address pattern for Indonesian addresses
+                'address': re.compile(r'\b(?:Jalan|Jl\.?|Kompleks|Komp\.?)\s+[A-Za-z0-9\s]+(?:No\.?|Nomor)?\s*\d+[A-Za-z]?\b,?\s*(?:[A-Za-z\s]+),?\s*\d{5}\b'),
+
+                # Modified credit card to avoid conflict with NIK
+                'credit_card': re.compile(r'\b(?:\d{4}[\s\-\.]{1,2}\d{4}[\s\-\.]{1,2}\d{4}[\s\-\.]{1,2}\d{4})\b'),
+            })
+        else:
+            # English patterns
+            self.regex_patterns.update({
+                'phone': re.compile(r'\b(?:\+\d{1,3}[- ]?)?\(?\d{3}\)?[- ]?\d{3}[- ]?\d{4}\b'),
+                'ssn': re.compile(r'\b\d{3}[-]?\d{2}[-]?\d{4}\b'),
+                'credit_card': re.compile(r'\b(?:\d{4}[-\s.]?){3}\d{4}\b|\b\d{16}\b'),
+                'date_of_birth': re.compile(r'\b(0[1-9]|1[0-2])[-/](0[1-9]|[12]\d|3[01])[-/](19|20)\d{2}\b'),
+                'address': re.compile(r'\b\d+\s+[A-Za-z\s]+(?:Street|St|Avenue|Ave|Road|Rd|Boulevard|Blvd|Lane|Ln|Drive|Dr|Court|Ct|Circle|Cir|Plaza|Pl)\b,?\s*[A-Za-z\s]+,?\s*[A-Z]{2}\s*\d{5}(-\d{4})?\b')
+            })
+
+    def _setup_non_pii_terms(self):
+        """Set up non-PII terms to exclude from detection"""
+        # Common business terms across languages
+        self.non_pii_terms = [
+            "company", "corporation", "limited", "inc", "ltd", "llc", "plc",
+            "department", "division", "unit", "team", "project"
+        ]
+
+        if self.language == "id":
+            # Indonesian business and document terms to exclude
+            self.non_pii_terms.extend([
+                "rp", "rupiah",
+
+                # Document sections
+                "proposal", "bisnis", "implementasi", "sistem", "erp", "ringkasan", "eksekutif",
+                "latar", "belakang", "perusahaan", "rencana", "implementasi", "proyeksi", "keuangan",
+                "analisis", "risiko", "strategi", "mitigasi", "fase", "kontak", "informasi",
+
+                # Business terms
+                "direktur", "manajer", "produksi", "manufaktur", "komponen", "elektronik",
+                "departemen", "keuangan", "sumber", "daya", "manusia", "manajemen", "rantai",
+                "pasokan", "anggaran", "vendor", "konsultan", "bulan", "tahun", "proses",
+                "teknologi", "pelatihan", "aplikasi", "module", "dashboard", "analytics",
+
+                # Company prefixes/suffixes
+                "pt", "cv", "persero", "tbk"
+            ])
+        else:
+            # English business and document terms to exclude
+            self.non_pii_terms.extend([
+                "executive", "summary", "introduction", "background", "overview", "proposal",
+                "project", "implementation", "plan", "analysis", "risk", "strategy", "phase",
+                "contact", "information", "director", "manager", "production", "manufacturing",
+                "finance", "human", "resources", "supply", "chain", "budget", "vendor", "consultant"
+            ])
+
+    def detect_nik_with_context(self, text: str) -> List[Dict]:
+        """
+        Specialized detection for Indonesian NIK numbers with context clues.
+
+        Args:
+            text: Text to search
+
+        Returns:
+            List of detected NIK instances with position information
+        """
+        if self.language != "id":
+            return []
+
+        results = []
+
+        # Patterns for NIK with context labels
+        nik_context_patterns = [
+            # NIK with label patterns
+            r'(?:NIK|KTP|Nomor\s+Induk\s+Kependudukan)(?:\s*:?\s*)(\d{16}|\d{2}\.\d{2}\.\d{2}\.\d{2}\.\d{2}\.\d{2})',
+            r'\(NIK:\s*(\d{16}|\d{2}\.\d{2}\.\d{2}\.\d{2}\.\d{2}\.\d{2})\)',
+            r'(?:NIK|KTP)(?:\s*[:=]\s*)(\d{16}|\d{2}\.\d{2}\.\d{2}\.\d{2}\.\d{2}\.\d{2})',
+        ]
+
+        for pattern in nik_context_patterns:
+            for match in re.finditer(pattern, text, re.IGNORECASE):
+                # Get the NIK part - if there's a capture group, use it
+                if match.lastindex:
+                    nik_text = match.group(1)
+                    start_pos = match.start(1)
+                    end_pos = match.end(1)
+                else:
+                    nik_text = match.group(0)
+                    start_pos = match.start()
+                    end_pos = match.end()
+
+                results.append({
+                    'text': nik_text,
+                    'start': start_pos,
+                    'end': end_pos,
+                    'type': 'nik',
+                    'method': 'context_detection'
+                })
+
+        return results
+
+    def _setup_pii_type_mapping(self):
+        """Set up PII type mapping based on language"""
+        # Common mappings across languages
         self.pii_type_mapping = {
-            'person': 'PERSON',
-            # 'organization': 'ORG', # will turn this on in future
-            'location': 'GPE',
-            'address': 'LOC',
-            'nationality': 'NORP',
-            'facility': 'FAC',
             'email': 'email',
-            'phone': 'phone',
-            'ssn': 'ssn',
             'credit_card': 'credit_card',
             'ip_address': 'ip_address',
-            'date_of_birth': 'date_of_birth'
         }
 
+        # Add language-specific mappings
+        if self.language == "en":
+            self.pii_type_mapping.update({
+                'person': 'PERSON',
+                'organization': 'ORG',
+                'location': 'GPE',
+                'address': 'address',
+                'nationality': 'NORP',
+                'facility': 'FAC',
+                'phone': 'phone',
+                'ssn': 'ssn',
+                'date_of_birth': 'date_of_birth'
+            })
+        elif self.language == "id":
+            self.pii_type_mapping.update({
+                'person': 'PERSON',
+                'organization': 'ORG',
+                'location': 'GPE',
+                'address': 'address',
+                'phone': 'phone',
+                'nik': 'nik',
+                'npwp': 'npwp'
+            })
+
+    def _setup_context_indicators(self):
+        """Set up context indicators for verification based on language"""
         # Name-related context indicators for verification
-        self.name_indicators = [
-            "name:", "nama:", "full name:", "by:", "from:", "to:",
-            "sincerely,", "regards,", "signed by", "signature",
-            "mr.", "mrs.", "ms.", "dr.", "prof."
+        if self.language == "en":
+            self.name_indicators = [
+                "name:", "full name:", "by:", "from:", "to:",
+                "sincerely,", "regards,", "signed by", "signature",
+                "mr.", "mrs.", "ms.", "dr.", "prof."
+            ]
+
+            # Additional title prefixes to improve name detection
+            self.title_prefixes = [
+                "Mr.", "Mrs.", "Ms.", "Miss", "Dr.", "Prof.", "Sir", "Madam",
+                "Lord", "Lady", "Rev.", "Hon."
+            ]
+        elif self.language == "id":
+            self.name_indicators = [
+                "nama:", "nama lengkap:", "oleh:", "dari:", "kepada:", "ditujukan kepada:",
+                "hormat saya,", "hormat kami,", "salam,", "tertanda,", "tanda tangan",
+                "bapak", "ibu", "sdr.", "sdri.", "saudara", "saudari", "dr.", "prof."
+            ]
+
+            # Indonesian title prefixes
+            self.title_prefixes = [
+                "Bapak", "Ibu", "Sdr.", "Sdri.", "Saudara", "Saudari", "Dr.", "Prof.", "Ir.",
+                "Haji", "Hajah", "H.", "Hj.", "Drs.", "Drg.", "Jenderal", "Kolonel", "Capt."
+            ]
+
+    def detect_indonesian_names(self, text: str) -> List[Dict]:
+        """
+        Specialized detection for Indonesian names with context.
+
+        Args:
+            text: Text to analyze
+
+        Returns:
+            List of detected name instances
+        """
+        if self.language != "id":
+            return []
+
+        results = []
+
+        # Common Indonesian name patterns with context
+        name_patterns = [
+            # People with titles
+            r'(?:Bapak|Ibu|Sdr\.|Sdri\.|Dr\.|Ir\.|Prof\.|H\.|Hj\.|Drs\.|Drg\.)[\s]+([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})',
+
+            # Name with position
+            r'(?:Direktur|Manajer|Manager|Kepala|Ketua|Wakil)[\s:]+([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})',
+
+            # Name with NIK
+            r'([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})[\s]*\(NIK:',
+
+            # Name followed by email or contact
+            r'([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})[\s]*(?:Email|HP|Telp|Telepon):'
         ]
-        
-        # Additional title prefixes to improve name detection
-        self.title_prefixes = [
-            "Mr.", "Mrs.", "Ms.", "Miss", "Dr.", "Prof.", "Sir", "Madam", 
-            "Lord", "Lady", "Rev.", "Hon."
-        ]
-        
-        logger.info(f"Initialized PIIDetector with model '{model_name}' (lazy loading)")
+
+        for pattern in name_patterns:
+            for match in re.finditer(pattern, text):
+                # Extract the name
+                if match.lastindex:
+                    name = match.group(1)
+                    start_pos = match.start(1)
+                    end_pos = match.end(1)
+                else:
+                    name = match.group(0)
+                    start_pos = match.start()
+                    end_pos = match.end()
+
+                # Check if this looks like a valid name
+                words = name.split()
+                if len(words) >= 2 and all(word[0].isupper() for word in words):
+                    results.append({
+                        'text': name,
+                        'start': start_pos,
+                        'end': end_pos,
+                        'type': 'person',
+                        'method': 'indonesian_name_detection'
+                    })
+
+        return results
 
     @property
     def nlp(self):
-        """Lazy load the spaCy model when needed"""
+        """Lazy load the spaCy model when needed based on language"""
         if self._nlp is None:
-            logger.info(f"Loading spaCy model '{self._model_name}'")
-            self._nlp = spacy.load(self._model_name)
-            # Add custom pipeline components if needed
-            # self._nlp.add_pipe("custom_component", last=True)
+            if self.language == "id":
+                try:
+                    # Try to load a multilingual model for Indonesian
+                    logger.info(f"Loading multilingual spaCy model for Indonesian")
+                    self._nlp = spacy.load("xx_ent_wiki_sm")
+                except OSError:
+                    # Fall back to English if multilingual model isn't available
+                    logger.warning(f"Multilingual model not available, using English model with Indonesian adaptations")
+                    self._nlp = spacy.load("en_core_web_md")
+                    # Add custom pipeline components to help with Indonesian
+                    # self._nlp.add_pipe("custom_id_entity_ruler", last=True)
+            else:
+                # Default to English
+                logger.info(f"Loading spaCy model '{self._model_name}'")
+                self._nlp = spacy.load(self._model_name)
         return self._nlp
 
     def set_redaction_marker(self, marker: str) -> None:
@@ -332,38 +547,101 @@ class PIIDetector:
         Returns:
             Boolean indicating if this should be treated as PII
         """
-        entity_text = entity.text
+        entity_text = entity.text.strip()
 
         # Skip very short entities - likely false positives
-        if len(entity_text.strip()) < 4:  # Increase threshold from 3 to 4
+        if len(entity_text) < 4:
             return False
-            
-        # Skip single words that are common in Latin text 
-        common_latin_words = ["sed", "et", "duis", "sunt", "esse", "ipsum", "amet", "elit", "sit"]
-        if entity_text.lower() in common_latin_words:
+
+        # Skip entities that are in our non-PII list
+        if entity_text.lower() in self.non_pii_terms:
+            return False
+
+        # Skip words that are document section headings
+        if self.language == "id":
+            indonesian_headers = ["proposal", "bisnis", "implementasi", "sistem", "ringkasan",
+                                  "eksekutif", "perusahaan", "proyeksi", "keuangan", "produksi"]
+            for header in indonesian_headers:
+                if entity_text.lower() == header:
+                    return False
+
+        # Skip all-uppercase words that are likely not names (but acronyms, headers, etc.)
+        if entity_text.isupper() and len(entity_text) > 3:
             return False
 
         # Check capitalization - names should be capitalized
         if not entity_text[0].isupper():
             return False
-            
-        # If all words are capitalized (title case), it's more likely to be a name
-        words = entity_text.split()
-        if len(words) >= 2 and all(word[0].isupper() for word in words if word):
-            return True
 
         # Get surrounding context
         context_start = max(0, entity.start_char - 50)
         context_end = min(len(text), entity.end_char + 50)
         surrounding = text[context_start:context_end].lower()
 
-        # Check for name indicators in context
-        for indicator in self.name_indicators:
+        # Look for name indicators in context (language-specific)
+        if self.language == "id":
+            name_indicators = [
+                "nama:", "bapak", "ibu", "sdr.", "sdri.", "tuan", "nyonya", "dr.", "ir.",
+                "direktur", "manager", "oleh:", "dengan", "kepada:", "ditujukan", "hormat",
+                "tertanda"
+            ]
+        else:
+            name_indicators = [
+                "name:", "mr.", "mrs.", "ms.", "dr.", "prof.", "by:", "from:", "to:",
+                "sincerely,", "regards,", "signed"
+            ]
+
+        for indicator in name_indicators:
             if indicator in surrounding:
                 return True
 
-        # If no strong evidence it's a name, assume it's not PII
+        # Special case for Indonesian names with multiple capitalized words
+        if self.language == "id" and len(entity_text.split()) > 1:
+            # If all words are capitalized, it's more likely a name
+            if all(word[0].isupper() for word in entity_text.split() if word):
+                # Make sure not all words are in the non-PII terms
+                if not all(word.lower() in self.non_pii_terms for word in entity_text.split()):
+                    return True
+
+        # If no evidence this is a name, assume it's not PII
         return False
+
+    def detect_indonesian_nik(self, text: str) -> List[Dict]:
+        """
+        Specialized function to detect Indonesian NIK numbers with context.
+
+        Args:
+            text: Text to analyze
+
+        Returns:
+            List of detected NIK instances
+        """
+        if self.language != "id":
+            return []
+
+        results = []
+
+        # Patterns to detect NIK with context
+        nik_patterns = [
+            r'(?:NIK|KTP|Nomor\s+Induk\s+Kependudukan|Nomor\s+KTP)(?:\s*:?\s*)(\d{16})',
+            r'(?:NIK|KTP|Nomor\s+Induk\s+Kependudukan|Nomor\s+KTP)(?:\s*:?\s*)(\d{6}(?:19|20)\d{2}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01])\d{4})',
+            r'(?:NIK|KTP|Nomor\s+Induk\s+Kependudukan|Nomor\s+KTP)(?:\s*:?\s*)(\d{2}\.\d{2}\.\d{2}\.\d{2}\.\d{2}\.\d{2})',
+            r'\(NIK:\s*(\d{16})\)',
+            r'\(NIK:\s*(\d{2}\.\d{2}\.\d{2}\.\d{2}\.\d{2}\.\d{2})\)'
+        ]
+
+        for pattern in nik_patterns:
+            for match in re.finditer(pattern, text, re.IGNORECASE):
+                nik_text = match.group(1) if match.lastindex else match.group(0)
+                results.append({
+                    'text': nik_text,
+                    'start': match.start(),
+                    'end': match.end(),
+                    'type': 'nik',
+                    'method': 'nik_detector'
+                })
+
+        return results
 
     def _remove_duplicates(self, pii_instances: List[Dict]) -> List[Dict]:
         """
