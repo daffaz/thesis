@@ -1,4 +1,4 @@
-# Privacy-First Document Processor
+# UAI Document Processor
 
 A privacy-focused document processing system with PII redaction and multi-language translation capabilities.
 

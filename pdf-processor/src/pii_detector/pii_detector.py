@@ -1,10 +1,7 @@
 import re
 import spacy
 from typing import Dict, List, Set, Tuple, Optional, Union
-import concurrent.futures
-from functools import lru_cache
 import logging
-import multiprocessing
 
 # Set up logging
 logger = logging.getLogger(__name__)
@@ -12,37 +9,50 @@ logger = logging.getLogger(__name__)
 class PIIDetector:
     """
     Detects and redacts personally identifiable information (PII) from text
-    using a combination of NER models and regex patterns with optimized performance.
+    using a combination of NER models and regex patterns.
     """
 
     def __init__(self, model_name: str = "en_core_web_md", chunk_size: int = 5000,
-                 enable_multithreading: bool = True, language: str = "en"):
+                 language: str = "en"):
         """
-        Initialize the PII detector with optimized loading and configuration.
+        Initialize the PII detector.
 
         Args:
             model_name: Name of the spaCy model to use
             chunk_size: Default size for text chunks when processing large documents
-            enable_multithreading: Whether to use multithreading for large documents
             language: Language code ('en' for English, 'id' for Indonesian)
         """
-        # Load model lazily when needed
-        self._nlp = None
-        self._model_name = model_name
+        # Initialize spaCy model
+        try:
+            if not spacy.util.is_package(model_name):
+                # Download the model if not available
+                spacy.cli.download(model_name)
+            self._nlp = spacy.load(model_name)
+            logger.info(f"Successfully loaded spaCy model '{model_name}'")
+        except Exception as e:
+            logger.error(f"Error loading spaCy model: {str(e)}")
+            # Fallback to small model if medium fails
+            try:
+                fallback_model = "en_core_web_sm" if language == "en" else "xx_ent_wiki_sm"
+                if not spacy.util.is_package(fallback_model):
+                    spacy.cli.download(fallback_model)
+                self._nlp = spacy.load(fallback_model)
+                logger.warning(f"Using fallback spaCy model '{fallback_model}'")
+            except Exception as e2:
+                logger.error(f"Error loading fallback model: {str(e2)}")
+                self._nlp = None
+
         self.redaction_marker = "***"  # Default redaction marker
         self.chunk_size = chunk_size
-        self.enable_multithreading = enable_multithreading
-        self.max_workers = min(4, (multiprocessing.cpu_count() or 1) * 2)
         self.language = language
-
+        
         # Set up regex patterns based on language
         self._setup_regex_patterns()
 
         # Set up non-PII terms to exclude
         self._setup_non_pii_terms()
 
-        # Other initialization code...
-        logger.info(f"Initialized PIIDetector with model '{model_name}' for language '{language}' (lazy loading)")
+        logger.info(f"Initialized PIIDetector for language '{language}'")
 
     def _setup_regex_patterns(self):
         """Set up regex patterns for PII detection based on language"""
@@ -55,27 +65,32 @@ class PIIDetector:
         if self.language == "id":
             # Indonesian-specific patterns
             self.regex_patterns.update({
-                # Enhanced phone pattern for Indonesian formats
-                'phone': re.compile(r'(?:\+62[\s\-]?\d{1,3}[\s\-]?\d{3,4}[\s\-]?\d{3,5})'  # Mobile format: +62-812-3456-7890
-                                    r'|(?:0\d{2,3}[\s\-]?\d{3,4}[\s\-]?\d{3,4})'  # Mobile format: 0812-3456-7890
-                                    r'|(?:\(\d{2,3}\)[\s\-]?\d{3,4}[\s\-]?\d{3,4})'),  # Landline format: (021) 5230-8765
+                # Enhanced phone pattern for Indonesian formats - IMPROVED VERSION
+                'phone': re.compile(
+                    r'(?:HP:?\s*(?:\+?\d{1,4}[-\s.]?\d{1,4}[-\s.]?\d{1,4}[-\s.]?\d{1,4}|\d{3,4}[-\s.]?\d{3,4}[-\s.]?\d{3,4}))'  # With HP: prefix
+                    r'|(?:\+\d{1,4}[-\s.]?\d{1,4}[-\s.]?\d{1,4}[-\s.]?\d{1,4})'  # International format
+                    r'|(?:0\d{2,3}[-\s.]?\d{3,4}[-\s.]?\d{3,4})'  # Indonesian mobile
+                    r'|(?:\(\d{2,3}\)[-\s.]?\d{3,4}[-\s.]?\d{3,4})'  # Landline with area code
+                ),
 
-                # NIK pattern (various formats)
+                # NIK pattern (various formats) - UNCHANGED
                 'nik': re.compile(r'\b\d{16}\b|\b\d{6}(?:19|20)\d{2}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01])\d{4}\b|\b\d{2}\.\d{2}\.\d{2}\.\d{2}\.\d{2}\.\d{2}\b'),
 
-                # NPWP pattern
+                # NPWP pattern - UNCHANGED
                 'npwp': re.compile(r'\b\d{2}\.\d{3}\.\d{3}\.\d{1}-\d{3}\.\d{3}\b'),
 
-                # Address pattern for Indonesian addresses
+                # Address pattern for Indonesian addresses - UNCHANGED
                 'address': re.compile(r'\b(?:Jalan|Jl\.?|Kompleks|Komp\.?)\s+[A-Za-z0-9\s]+(?:No\.?|Nomor)?\s*\d+[A-Za-z]?\b,?\s*(?:[A-Za-z\s]+),?\s*\d{5}\b'),
 
-                # Modified credit card to avoid conflict with NIK
+                # Credit card pattern - UNCHANGED
                 'credit_card': re.compile(r'\b(?:\d{4}[\s\-\.]{1,2}\d{4}[\s\-\.]{1,2}\d{4}[\s\-\.]{1,2}\d{4})\b'),
             })
         else:
-            # English patterns
+            # English patterns - UPDATED to improve phone detection
             self.regex_patterns.update({
-                'phone': re.compile(r'\b(?:\+\d{1,3}[- ]?)?\(?\d{3}\)?[- ]?\d{3}[- ]?\d{4}\b'),
+                'phone': re.compile(
+                    r'(?:Phone:?\s*|Tel:?\s*|HP:?\s*)?(?:\+?\d{1,3}[- ]?)?\(?\d{3}\)?[- ]?\d{3}[- ]?\d{4}\b'
+                ),
                 'ssn': re.compile(r'\b\d{3}[-]?\d{2}[-]?\d{4}\b'),
                 'credit_card': re.compile(r'\b(?:\d{4}[-\s.]?){3}\d{4}\b|\b\d{16}\b'),
                 'date_of_birth': re.compile(r'\b(0[1-9]|1[0-2])[-/](0[1-9]|[12]\d|3[01])[-/](19|20)\d{2}\b'),
@@ -118,235 +133,53 @@ class PIIDetector:
                 "finance", "human", "resources", "supply", "chain", "budget", "vendor", "consultant"
             ])
 
-    def detect_nik_with_context(self, text: str) -> List[Dict]:
-        """
-        Specialized detection for Indonesian NIK numbers with context clues.
-
-        Args:
-            text: Text to search
-
-        Returns:
-            List of detected NIK instances with position information
-        """
-        if self.language != "id":
-            return []
-
-        results = []
-
-        # Patterns for NIK with context labels
-        nik_context_patterns = [
-            # NIK with label patterns
-            r'(?:NIK|KTP|Nomor\s+Induk\s+Kependudukan)(?:\s*:?\s*)(\d{16}|\d{2}\.\d{2}\.\d{2}\.\d{2}\.\d{2}\.\d{2})',
-            r'\(NIK:\s*(\d{16}|\d{2}\.\d{2}\.\d{2}\.\d{2}\.\d{2}\.\d{2})\)',
-            r'(?:NIK|KTP)(?:\s*[:=]\s*)(\d{16}|\d{2}\.\d{2}\.\d{2}\.\d{2}\.\d{2}\.\d{2})',
-        ]
-
-        for pattern in nik_context_patterns:
-            for match in re.finditer(pattern, text, re.IGNORECASE):
-                # Get the NIK part - if there's a capture group, use it
-                if match.lastindex:
-                    nik_text = match.group(1)
-                    start_pos = match.start(1)
-                    end_pos = match.end(1)
-                else:
-                    nik_text = match.group(0)
-                    start_pos = match.start()
-                    end_pos = match.end()
-
-                results.append({
-                    'text': nik_text,
-                    'start': start_pos,
-                    'end': end_pos,
-                    'type': 'nik',
-                    'method': 'context_detection'
-                })
-
-        return results
-
-    def _setup_pii_type_mapping(self):
-        """Set up PII type mapping based on language"""
-        # Common mappings across languages
-        self.pii_type_mapping = {
-            'email': 'email',
-            'credit_card': 'credit_card',
-            'ip_address': 'ip_address',
-        }
-
-        # Add language-specific mappings
-        if self.language == "en":
-            self.pii_type_mapping.update({
-                'person': 'PERSON',
-                'organization': 'ORG',
-                'location': 'GPE',
-                'address': 'address',
-                'nationality': 'NORP',
-                'facility': 'FAC',
-                'phone': 'phone',
-                'ssn': 'ssn',
-                'date_of_birth': 'date_of_birth'
-            })
-        elif self.language == "id":
-            self.pii_type_mapping.update({
-                'person': 'PERSON',
-                'organization': 'ORG',
-                'location': 'GPE',
-                'address': 'address',
-                'phone': 'phone',
-                'nik': 'nik',
-                'npwp': 'npwp'
-            })
-
-    def _setup_context_indicators(self):
-        """Set up context indicators for verification based on language"""
-        # Name-related context indicators for verification
-        if self.language == "en":
-            self.name_indicators = [
-                "name:", "full name:", "by:", "from:", "to:",
-                "sincerely,", "regards,", "signed by", "signature",
-                "mr.", "mrs.", "ms.", "dr.", "prof."
-            ]
-
-            # Additional title prefixes to improve name detection
-            self.title_prefixes = [
-                "Mr.", "Mrs.", "Ms.", "Miss", "Dr.", "Prof.", "Sir", "Madam",
-                "Lord", "Lady", "Rev.", "Hon."
-            ]
-        elif self.language == "id":
-            self.name_indicators = [
-                "nama:", "nama lengkap:", "oleh:", "dari:", "kepada:", "ditujukan kepada:",
-                "hormat saya,", "hormat kami,", "salam,", "tertanda,", "tanda tangan",
-                "bapak", "ibu", "sdr.", "sdri.", "saudara", "saudari", "dr.", "prof."
-            ]
-
-            # Indonesian title prefixes
-            self.title_prefixes = [
-                "Bapak", "Ibu", "Sdr.", "Sdri.", "Saudara", "Saudari", "Dr.", "Prof.", "Ir.",
-                "Haji", "Hajah", "H.", "Hj.", "Drs.", "Drg.", "Jenderal", "Kolonel", "Capt."
-            ]
-
-    def detect_indonesian_names(self, text: str) -> List[Dict]:
-        """
-        Specialized detection for Indonesian names with context.
-
-        Args:
-            text: Text to analyze
-
-        Returns:
-            List of detected name instances
-        """
-        if self.language != "id":
-            return []
-
-        results = []
-
-        # Common Indonesian name patterns with context
-        name_patterns = [
-            # People with titles
-            r'(?:Bapak|Ibu|Sdr\.|Sdri\.|Dr\.|Ir\.|Prof\.|H\.|Hj\.|Drs\.|Drg\.)[\s]+([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})',
-
-            # Name with position
-            r'(?:Direktur|Manajer|Manager|Kepala|Ketua|Wakil)[\s:]+([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})',
-
-            # Name with NIK
-            r'([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})[\s]*\(NIK:',
-
-            # Name followed by email or contact
-            r'([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})[\s]*(?:Email|HP|Telp|Telepon):'
-        ]
-
-        for pattern in name_patterns:
-            for match in re.finditer(pattern, text):
-                # Extract the name
-                if match.lastindex:
-                    name = match.group(1)
-                    start_pos = match.start(1)
-                    end_pos = match.end(1)
-                else:
-                    name = match.group(0)
-                    start_pos = match.start()
-                    end_pos = match.end()
-
-                # Check if this looks like a valid name
-                words = name.split()
-                if len(words) >= 2 and all(word[0].isupper() for word in words):
-                    results.append({
-                        'text': name,
-                        'start': start_pos,
-                        'end': end_pos,
-                        'type': 'person',
-                        'method': 'indonesian_name_detection'
-                    })
-
-        return results
-
-    @property
-    def nlp(self):
-        """Lazy load the spaCy model when needed based on language"""
-        if self._nlp is None:
-            if self.language == "id":
-                try:
-                    # Try to load a multilingual model for Indonesian
-                    logger.info(f"Loading multilingual spaCy model for Indonesian")
-                    self._nlp = spacy.load("xx_ent_wiki_sm")
-                except OSError:
-                    # Fall back to English if multilingual model isn't available
-                    logger.warning(f"Multilingual model not available, using English model with Indonesian adaptations")
-                    self._nlp = spacy.load("en_core_web_md")
-                    # Add custom pipeline components to help with Indonesian
-                    # self._nlp.add_pipe("custom_id_entity_ruler", last=True)
-            else:
-                # Default to English
-                logger.info(f"Loading spaCy model '{self._model_name}'")
-                self._nlp = spacy.load(self._model_name)
-        return self._nlp
-
-    def set_redaction_marker(self, marker: str) -> None:
-        """
-        Set the marker used for redacting PII.
-
-        Args:
-            marker: String to replace PII with
-        """
-        self.redaction_marker = marker
-
     def detect_pii(self, text: str, pii_types: Optional[List[str]] = None) -> List[Dict]:
         """
-        Detect PII in the given text.
-
+        Detect PII in text using NER and regex patterns.
+        
         Args:
-            text: Text to analyze for PII
-            pii_types: List of PII types to detect (if None, detect all)
-
+            text: Text to analyze
+            pii_types: Optional list of PII types to detect
+            
         Returns:
-            List of dictionaries with information about detected PII
+            List of detected PII instances
         """
-        if not text or not text.strip():
-            return []
-
-        # Determine which PII types to detect
-        ner_types_to_include, regex_types_to_include = self._resolve_pii_types(pii_types)
-        logger = logging.getLogger(__name__)
-        logger.info(f"Starting regex detection for types: {regex_types_to_include}")
-
-        # Check if this is a large text that should be chunked
+        # Resolve which PII types to detect
+        ner_types, regex_types = self._resolve_pii_types(pii_types)
+        
+        # Process text in chunks if it's large
         if len(text) > self.chunk_size:
             return self.detect_pii_in_chunks(text, pii_types)
             
-        # Process the text
-        pii_instances = self._process_text(text, ner_types_to_include, regex_types_to_include)
+        return self._process_text(text, ner_types, regex_types)
+
+    def detect_pii_in_chunks(self, text: str, pii_types: Optional[List[str]] = None, 
+                         overlap: int = 200) -> List[Dict]:
+        """Process large text in chunks to avoid memory issues."""
+        # Resolve which PII types to detect
+        ner_types, regex_types = self._resolve_pii_types(pii_types)
         
-        # Special handling for credit cards - try to detect fragments if no credit cards found
-        if 'credit_card' in regex_types_to_include:
-            credit_card_found = any(item['type'] == 'credit_card' for item in pii_instances)
-            if not credit_card_found:
-                # Try to detect and reassemble credit card fragments
-                credit_card_fragments = self.detect_credit_card_fragments(text)
-                if credit_card_fragments:
-                    logger.info(f"Successfully reassembled {len(credit_card_fragments)} credit cards from fragments")
-                    pii_instances.extend(credit_card_fragments)
-        
-        return pii_instances
-        
+        # Split text into overlapping chunks
+        chunks = []
+        start = 0
+        while start < len(text):
+            end = min(start + self.chunk_size, len(text))
+            # Extend to word boundary if possible
+            if end < len(text):
+                while end > start and not text[end].isspace():
+                    end -= 1
+            chunks.append((start, text[start:end]))
+            start = end - overlap if end < len(text) else end
+            
+        # Process each chunk
+        all_results = []
+        for offset, chunk_text in chunks:
+            chunk_results = self._process_chunk(chunk_text, offset, ner_types, regex_types)
+            all_results.extend(chunk_results)
+            
+        # Remove duplicates from overlapping regions
+        return self._remove_duplicates(all_results)
+
     def _resolve_pii_types(self, pii_types: Optional[List[str]]) -> Tuple[List[str], List[str]]:
         """
         Resolve the requested PII types to internal representation.
@@ -367,8 +200,8 @@ class PIIDetector:
             normalized_types = []
             for pii_type in pii_types:
                 pii_type_lower = pii_type.lower()
-                if pii_type_lower in self.pii_type_mapping:
-                    normalized_types.append(self.pii_type_mapping[pii_type_lower])
+                if pii_type_lower in self.regex_patterns:
+                    normalized_types.append(pii_type_lower)
                 else:
                     # If it's already in internal format
                     normalized_types.append(pii_type)
@@ -378,17 +211,17 @@ class PIIDetector:
             regex_types_to_include = [t for t in regex_types_to_include if t in normalized_types]
             
         return ner_types_to_include, regex_types_to_include
-    
-    def _process_text(self, text: str, ner_types_to_include: List[str], 
-                     regex_types_to_include: List[str]) -> List[Dict]:
+
+    def _process_text(self, text: str, ner_types_to_include: List[str],
+                      regex_types_to_include: List[str]) -> List[Dict]:
         """
         Process a single chunk of text to detect PII.
-        
+
         Args:
             text: Text to analyze
             ner_types_to_include: NER entity types to detect
             regex_types_to_include: Regex pattern types to use
-            
+
         Returns:
             List of detected PII instances
         """
@@ -397,7 +230,7 @@ class PIIDetector:
         try:
             # Use spaCy NER for named entities if any NER types are included
             if ner_types_to_include:
-                doc = self.nlp(text)
+                doc = self._nlp(text)
 
                 # Extract entities detected by spaCy
                 for ent in doc.ents:
@@ -418,19 +251,7 @@ class PIIDetector:
             if regex_types_to_include:
                 for pii_type, pattern in self.regex_patterns.items():
                     if pii_type in regex_types_to_include:
-                        logger.info(f"Searching for {pii_type} with pattern: {pattern}")
-                        matches = list(re.finditer(pattern, text))
-                        logger.info(f"Found {len(matches)} matches for {pii_type}")
-                        
-                        if pii_type == 'credit_card' and not matches:
-                            # Look for any digit sequences that might be credit cards
-                            digit_seqs = re.findall(r'\d{4,}', text)
-                            if digit_seqs:
-                                logger.info(f"Found digit sequences that might be parts of CC: {digit_seqs[:10]}")
-
                         for match in pattern.finditer(text):
-                            found_text = match.group()
-                            logger.info(f"Found {pii_type}: {found_text[:4]}...{found_text[-4:]} at position {match.start()}-{match.end()}")
                             pii_instances.append({
                                 'text': match.group(),
                                 'start': match.start(),
@@ -448,70 +269,7 @@ class PIIDetector:
         except Exception as e:
             logger.error(f"Error in detect_pii: {str(e)}")
             return []
-        
-    
-    def detect_pii_in_chunks(self, text: str, pii_types: Optional[List[str]] = None, 
-                         overlap: int = 200) -> List[Dict]:
-        """
-        Detect PII in a large text by processing it in overlapping chunks.
-        Uses multithreading if enabled.
-        
-        Args:
-            text: Text to analyze for PII
-            pii_types: List of PII types to detect (if None, detect all)
-            overlap: Overlap between chunks to avoid missing PII that spans chunk boundaries
-            
-        Returns:
-            List of dictionaries with information about detected PII
-        """
-        if not text or not text.strip():
-            return []
-        
-        # If the text is small enough, process it directly
-        if len(text) <= self.chunk_size:
-            return self.detect_pii(text, pii_types)
-        
-        # Resolve PII types once for all chunks
-        ner_types, regex_types = self._resolve_pii_types(pii_types)
-        
-        # Create chunks
-        chunks = []
-        offset = 0
-        
-        while offset < len(text):
-            # Get the chunk with overlap
-            end = min(offset + self.chunk_size, len(text))
-            chunks.append((text[offset:end], offset))
-            
-            # Move to the next chunk with overlap
-            offset = end - overlap if end < len(text) else len(text)
-            
-        # Process chunks
-        all_pii = []
-        
-        if self.enable_multithreading and len(chunks) > 1:
-            # Process chunks in parallel
-            with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-                futures = []
-                
-                for chunk_text, chunk_offset in chunks:
-                    future = executor.submit(
-                        self._process_chunk, chunk_text, chunk_offset, ner_types, regex_types
-                    )
-                    futures.append(future)
-                
-                # Collect results as they complete
-                for future in concurrent.futures.as_completed(futures):
-                    all_pii.extend(future.result())
-        else:
-            # Process chunks sequentially
-            for chunk_text, chunk_offset in chunks:
-                chunk_pii = self._process_chunk(chunk_text, chunk_offset, ner_types, regex_types)
-                all_pii.extend(chunk_pii)
-        
-        # Remove duplicates that might occur in overlapping regions
-        return self._remove_duplicates(all_pii)
-    
+
     def _process_chunk(self, chunk_text: str, offset: int, ner_types: List[str], 
                       regex_types: List[str]) -> List[Dict]:
         """
@@ -606,43 +364,6 @@ class PIIDetector:
         # If no evidence this is a name, assume it's not PII
         return False
 
-    def detect_indonesian_nik(self, text: str) -> List[Dict]:
-        """
-        Specialized function to detect Indonesian NIK numbers with context.
-
-        Args:
-            text: Text to analyze
-
-        Returns:
-            List of detected NIK instances
-        """
-        if self.language != "id":
-            return []
-
-        results = []
-
-        # Patterns to detect NIK with context
-        nik_patterns = [
-            r'(?:NIK|KTP|Nomor\s+Induk\s+Kependudukan|Nomor\s+KTP)(?:\s*:?\s*)(\d{16})',
-            r'(?:NIK|KTP|Nomor\s+Induk\s+Kependudukan|Nomor\s+KTP)(?:\s*:?\s*)(\d{6}(?:19|20)\d{2}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01])\d{4})',
-            r'(?:NIK|KTP|Nomor\s+Induk\s+Kependudukan|Nomor\s+KTP)(?:\s*:?\s*)(\d{2}\.\d{2}\.\d{2}\.\d{2}\.\d{2}\.\d{2})',
-            r'\(NIK:\s*(\d{16})\)',
-            r'\(NIK:\s*(\d{2}\.\d{2}\.\d{2}\.\d{2}\.\d{2}\.\d{2})\)'
-        ]
-
-        for pattern in nik_patterns:
-            for match in re.finditer(pattern, text, re.IGNORECASE):
-                nik_text = match.group(1) if match.lastindex else match.group(0)
-                results.append({
-                    'text': nik_text,
-                    'start': match.start(),
-                    'end': match.end(),
-                    'type': 'nik',
-                    'method': 'nik_detector'
-                })
-
-        return results
-
     def _remove_duplicates(self, pii_instances: List[Dict]) -> List[Dict]:
         """
         Remove duplicate PII detections using an efficient algorithm.
@@ -716,17 +437,12 @@ class PIIDetector:
         # Detect PII with the specified types
         pii_instances = self.detect_pii(text, pii_types)
 
-        logger = logging.getLogger(__name__)
-        logger.info(f"Detected {len(pii_instances)} PII instances to redact")
-
         # Make a copy of the original text
         redacted_text = text
 
         # Apply redactions from end to beginning to avoid offset issues
         redacted_items = []
         for item in sorted(pii_instances, key=lambda x: x['start'], reverse=True):
-            # TODO REMOVE THIS LATER
-            logger.info(f"Redacting {item['type']}: {item['text'][:4]}...{item['text'][-4:]} at position {item['start']}-{item['end']}")
             # Get the length of the PII text
             pii_length = item['end'] - item['start']
 
@@ -737,9 +453,9 @@ class PIIDetector:
 
             # Apply the redaction
             redacted_text = (
-                redacted_text[:item['start']] +
-                redaction +
-                redacted_text[item['end']:]
+                    redacted_text[:item['start']] +
+                    redaction +
+                    redacted_text[item['end']:]
             )
 
             redacted_items.append({
@@ -766,36 +482,16 @@ class PIIDetector:
         redacted_document = {}
         all_redacted_items = []
 
-        # Process pages in parallel if multithreading is enabled and document is large
-        if self.enable_multithreading and len(document) > 1:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-                futures = {}
-                
-                for page_num, page_content in document.items():
-                    futures[executor.submit(self._redact_page, page_content, page_num, pii_types)] = page_num
-                
-                # Collect results as they complete
-                for future in concurrent.futures.as_completed(futures):
-                    page_num = futures[future]
-                    try:
-                        redacted_page, redacted_items = future.result()
-                        redacted_document[page_num] = redacted_page
-                        all_redacted_items.extend(redacted_items)
-                    except Exception as e:
-                        logger.error(f"Error redacting page {page_num}: {str(e)}")
-                        # Copy original page content on error
-                        redacted_document[page_num] = document[page_num].copy()
-        else:
-            # Process pages sequentially
-            for page_num, page_content in document.items():
-                try:
-                    redacted_page, redacted_items = self._redact_page(page_content, page_num, pii_types)
-                    redacted_document[page_num] = redacted_page
-                    all_redacted_items.extend(redacted_items)
-                except Exception as e:
-                    logger.error(f"Error redacting page {page_num}: {str(e)}")
-                    # Copy original page content on error
-                    redacted_document[page_num] = page_content.copy()
+        # Process pages sequentially
+        for page_num, page_content in document.items():
+            try:
+                redacted_page, redacted_items = self._redact_page(page_content, page_num, pii_types)
+                redacted_document[page_num] = redacted_page
+                all_redacted_items.extend(redacted_items)
+            except Exception as e:
+                logger.error(f"Error redacting page {page_num}: {str(e)}")
+                # Copy original page content on error
+                redacted_document[page_num] = page_content.copy()
 
         # Deduplicate redacted items
         unique_redacted_items = []
@@ -1006,36 +702,16 @@ class PIIDetector:
         """
         all_pii = []
 
-        # Use multithreading for large documents
-        if self.enable_multithreading and len(document) > 1:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-                futures = {}
-                
-                for page_num, page_content in document.items():
-                    if 'text' in page_content and page_content['text']:
-                        futures[executor.submit(self.detect_pii, page_content['text'], pii_types)] = page_num
-                
-                # Collect results as they complete
-                for future in concurrent.futures.as_completed(futures):
-                    page_num = futures[future]
-                    try:
-                        page_pii = future.result()
-                        for item in page_pii:
-                            item['page'] = page_num
-                        all_pii.extend(page_pii)
-                    except Exception as e:
-                        logger.error(f"Error getting PII statistics for page {page_num}: {str(e)}")
-        else:
-            # Process pages sequentially
-            for page_num, page_content in document.items():
-                if 'text' in page_content and page_content['text']:
-                    try:
-                        page_pii = self.detect_pii(page_content['text'], pii_types)
-                        for item in page_pii:
-                            item['page'] = page_num
-                        all_pii.extend(page_pii)
-                    except Exception as e:
-                        logger.error(f"Error getting PII statistics for page {page_num}: {str(e)}")
+        # Process pages sequentially
+        for page_num, page_content in document.items():
+            if 'text' in page_content and page_content['text']:
+                try:
+                    page_pii = self.detect_pii(page_content['text'], pii_types)
+                    for item in page_pii:
+                        item['page'] = page_num
+                    all_pii.extend(page_pii)
+                except Exception as e:
+                    logger.error(f"Error getting PII statistics for page {page_num}: {str(e)}")
 
         # Deduplicate PII instances
         unique_pii = []

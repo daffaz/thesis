@@ -1,0 +1,4 @@
+# Basic requirements without GPU support
+torch
+transformers==4.37.2
+protobuf==4.25.2 

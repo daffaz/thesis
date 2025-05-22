@@ -1,7 +1,7 @@
 FROM golang:1.24-alpine AS builder
 
 # Install necessary tools
-RUN apk add --no-cache git protoc protobuf-dev
+RUN apk add --no-cache git protoc protobuf-dev dos2unix
 
 # Set up working directory
 WORKDIR /app
@@ -21,13 +21,12 @@ COPY . .
 
 # Generate protobuf code
 RUN mkdir -p pkg/pdf/pdf_processor && \
-    cd /app && \
+    dos2unix script/generate_proto.sh && \
     chmod +x script/generate_proto.sh && \
-    sh script/generate_proto.sh
+    ./script/generate_proto.sh
 
 # Build the application
 RUN CGO_ENABLED=0 GOOS=linux go build -gcflags="all=-N -l" -a -installsuffix cgo -o api-server ./cmd/server
-# RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o api-server ./cmd/server
 
 # Create a minimal runtime container
 FROM alpine:3.18

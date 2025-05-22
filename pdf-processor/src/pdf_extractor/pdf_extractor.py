@@ -15,15 +15,17 @@ class PDFExtractor:
     to ensure high-quality extraction, including handling of scanned documents.
     """
     
-    def __init__(self, enable_ocr: bool = True):
+    def __init__(self, enable_ocr=True, subprocess_mode=False):
         """
         Initialize the PDF extractor.
         
         Args:
             enable_ocr: Whether to use OCR for scanned documents
+            subprocess_mode: If True, avoid using features that can't be pickled
         """
-        self.enable_ocr = enable_ocr
-        
+        self.enable_ocr = enable_ocr and not subprocess_mode
+        self.subprocess_mode = subprocess_mode
+
     def extract_text(self, pdf_path: str) -> Dict[int, Dict]:
         """
         Extract text from a PDF file while preserving structure.
@@ -35,25 +37,29 @@ class PDFExtractor:
         Returns:
             Dictionary with page numbers as keys and structured content as values
         """
-        # Validate file exists and is a PDF
-        if not os.path.exists(pdf_path):
-            raise FileNotFoundError(f"PDF file not found: {pdf_path}")
-        
-        if not pdf_path.lower().endswith('.pdf'):
-            raise ValueError(f"File is not a PDF: {pdf_path}")
-        
-        # First try extraction with PyPDF2
-        content = self._extract_with_pypdf2(pdf_path)
-        
-        # If content is empty or seems to be a scanned document, try pdfminer for more structure
-        if self._is_low_text_content(content):
-            content = self._extract_with_pdfminer(pdf_path)
+        try:
+            # Validate file exists and is a PDF
+            if not os.path.exists(pdf_path):
+                raise FileNotFoundError(f"PDF file not found: {pdf_path}")
             
-        # If still low content and OCR is enabled, try OCR
-        if self._is_low_text_content(content) and self.enable_ocr:
-            content = self._extract_with_ocr(pdf_path)
-        
-        return content
+            if not pdf_path.lower().endswith('.pdf'):
+                raise ValueError(f"File is not a PDF: {pdf_path}")
+            
+            # First try extraction with PyPDF2
+            content = self._extract_with_pypdf2(pdf_path)
+            
+            # If content is empty or seems to be a scanned document, try pdfminer for more structure
+            if self._is_low_text_content(content):
+                content = self._extract_with_pdfminer(pdf_path)
+            
+            # If still low content and OCR is enabled and not in subprocess mode, try OCR
+            if self._is_low_text_content(content) and self.enable_ocr and not self.subprocess_mode:
+                content = self._extract_with_ocr(pdf_path)
+            
+            return content
+        except Exception as e:
+            print(f"Error extracting text: {e}")
+            return {1: {'text': '', 'metadata': {'error': str(e)}}}
     
     def _is_low_text_content(self, content: Dict[int, Dict]) -> bool:
         """
@@ -181,8 +187,8 @@ class PDFExtractor:
         result = {}
         
         try:
-            # Convert PDF to images
-            images = convert_from_path(pdf_path)
+            # Convert PDF to images - use single thread to avoid multiprocessing conflicts
+            images = convert_from_path(pdf_path, thread_count=1)
             
             for i, image in enumerate(images):
                 page_number = i + 1

@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { PDFDocument, rgb } from 'pdf-lib';
 import type { PDFDocumentProxy, PageViewport, RenderTask } from 'pdfjs-dist';
+import { api, RedactionStats } from '@/services/api';
 
 // We'll initialize pdfjsLib dynamically
 let pdfjsLib: any = null;
@@ -21,6 +22,37 @@ interface RedactionArea {
   pageIndex: number;
 }
 
+interface RedactionStatsProps {
+  stats: RedactionStats;
+}
+
+function RedactionStatsDisplay({ stats }: RedactionStatsProps) {
+  return (
+    <div className="bg-gray-50 rounded-lg p-4 space-y-3">
+      <h3 className="text-sm font-medium text-gray-900">Redaction Statistics</h3>
+      
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+        <div>
+          <p className="text-sm font-medium text-gray-700">Total PII Found</p>
+          <p className="text-2xl font-semibold text-blue-600">{stats.totalPIICount}</p>
+        </div>
+        
+        <div>
+          <p className="text-sm font-medium text-gray-700">PII Types Found</p>
+          <div className="space-y-1">
+            {Object.entries(stats.byType).map(([type, count]) => (
+              <div key={type} className="flex justify-between text-sm">
+                <span className="text-gray-600">{type}</span>
+                <span className="font-medium text-gray-900">{count}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export default function PDFViewer({ file, mode, onReset }: PDFViewerProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const currentRenderTask = useRef<RenderTask | null>(null);
@@ -33,6 +65,9 @@ export default function PDFViewer({ file, mode, onReset }: PDFViewerProps) {
   const [startPoint, setStartPoint] = useState<{ x: number; y: number } | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [isProcessing, setIsProcessing] = useState(false);
+  const [processingStatus, setProcessingStatus] = useState<string>('');
+  const [redactionStats, setRedactionStats] = useState<RedactionStats | null>(null);
 
   const renderPage = async (doc: PDFDocumentProxy, pageNumber: number) => {
     if (!doc) return;
@@ -119,7 +154,7 @@ export default function PDFViewer({ file, mode, onReset }: PDFViewerProps) {
     const x = e.clientX - rect.left;
     const y = e.clientY - rect.top;
 
-    const context = canvas.getContext('');
+    const context = canvas.getContext('2d');
     if (!context || !pdfDoc) return;
 
     // Redraw the page
@@ -222,6 +257,60 @@ export default function PDFViewer({ file, mode, onReset }: PDFViewerProps) {
       URL.revokeObjectURL(url);
     } catch (error) {
       console.error('Error applying redactions:', error);
+    }
+  };
+
+  const handleAutoRedaction = async () => {
+    try {
+      setIsProcessing(true);
+      setProcessingStatus('Uploading document for auto-redaction...');
+
+      const response = await api.uploadForAutoRedaction(file);
+
+      if (!response.success) {
+        throw new Error(response.message || 'Auto-redaction failed');
+      }
+
+      // Set redaction stats if available
+      if (response.redactionStats) {
+        setRedactionStats(response.redactionStats);
+        setProcessingStatus(`Auto-redaction complete. Found ${response.redactionStats.totalPIICount} PII instances.`);
+      } else {
+        setProcessingStatus('Auto-redaction complete. Downloading result...');
+      }
+
+      // If we have a redacted PDF URL, download it
+      if (response.redactedPdfUrl) {
+        const redactedPdfResponse = await fetch(response.redactedPdfUrl);
+        const blob = await redactedPdfResponse.blob();
+        const url = URL.createObjectURL(blob);
+
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `redacted-${file.name}`;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+      }
+
+      // Don't reset immediately if we have stats to show
+      if (!response.redactionStats) {
+        onReset();
+      }
+    } catch (error) {
+      console.error('Error during auto-redaction:', error);
+      setError(error instanceof Error ? error.message : 'An unknown error occurred during auto-redaction');
+    } finally {
+      setIsProcessing(false);
+    }
+  };
+
+  const handleRedaction = async () => {
+    if (mode === 'auto') {
+      await handleAutoRedaction();
+    } else {
+      await applyRedactions();
     }
   };
 
@@ -333,82 +422,75 @@ export default function PDFViewer({ file, mode, onReset }: PDFViewerProps) {
   }
 
   return (
-    <div className="bg-white rounded-xl shadow-lg overflow-hidden">
-      <div className="p-4 border-b border-gray-100">
-        <div className="flex justify-between items-center">
-          <div className="flex items-center space-x-3">
+    <div className="space-y-6">
+      <div className="flex items-center justify-between">
+        <div className="flex items-center space-x-4">
+          <h2 className="text-lg font-medium text-gray-900">
+            {mode === 'auto' ? 'Auto Redaction' : mode === 'manual' ? 'Manual Redaction' : 'Combined Redaction'}
+          </h2>
+          {mode !== 'auto' && (
+            <p className="text-sm text-gray-500">
+              Draw rectangles to redact sensitive information
+            </p>
+          )}
+        </div>
+        <div className="flex items-center space-x-3">
+          <button
+            onClick={onReset}
+            className="px-4 py-2 text-sm font-medium text-gray-700 hover:bg-gray-100 rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+            disabled={isProcessing}
+          >
+            {redactionStats ? 'Done' : 'Cancel'}
+          </button>
+          {!redactionStats && (
             <button
-              onClick={() => {
-                if (currentPage > 1 && !isLoading && pdfDoc) {
-                  setCurrentPage(currentPage - 1);
-                }
-              }}
-              className="p-2 text-gray-600 hover:bg-gray-100 rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-              disabled={currentPage <= 1 || isLoading}
-            >
-              <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" />
-              </svg>
-            </button>
-            <span className="text-sm font-medium text-gray-700">
-              Page {currentPage} of {totalPages}
-            </span>
-            <button
-              onClick={() => {
-                if (currentPage < totalPages && !isLoading && pdfDoc) {
-                  setCurrentPage(currentPage + 1);
-                }
-              }}
-              className="p-2 text-gray-600 hover:bg-gray-100 rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-              disabled={currentPage >= totalPages || isLoading}
-            >
-              <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
-              </svg>
-            </button>
-          </div>
-          <div className="flex items-center space-x-3">
-            <button
-              onClick={onReset}
-              className="px-4 py-2 text-sm font-medium text-gray-700 hover:bg-gray-100 rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-              disabled={isLoading}
-            >
-              Cancel
-            </button>
-            <button
-              onClick={applyRedactions}
+              onClick={handleRedaction}
               className="px-4 py-2 text-sm font-medium text-white bg-blue-600 hover:bg-blue-700 rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center"
-              disabled={isLoading || redactionAreas.length === 0}
+              disabled={isProcessing || (mode !== 'auto' && redactionAreas.length === 0)}
             >
-              <span>Apply Redactions</span>
-              {isLoading && (
+              <span>
+                {mode === 'auto' ? 'Start Auto-Redaction' : 'Apply Redactions'}
+              </span>
+              {(isProcessing || isLoading) && (
                 <svg className="animate-spin ml-2 h-4 w-4 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
                   <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
                   <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
                 </svg>
               )}
             </button>
-          </div>
+          )}
         </div>
       </div>
 
-      <div className="relative bg-gray-50">
-        {isLoading && (
-          <div className="absolute inset-0 bg-white bg-opacity-75 flex items-center justify-center z-10">
-            <div className="animate-spin rounded-full h-12 w-12 border-4 border-blue-600 border-t-transparent"></div>
-          </div>
-        )}
-        
-        <div className="p-6 flex justify-center">
-          <canvas
-            ref={canvasRef}
-            onMouseDown={handleMouseDown}
-            onMouseMove={handleMouseMove}
-            onMouseUp={handleMouseUp}
-            className="max-w-full rounded shadow-sm"
-          />
+      {processingStatus && (
+        <div className="bg-blue-50 text-blue-700 px-4 py-2 rounded-lg text-sm">
+          {processingStatus}
         </div>
-      </div>
+      )}
+
+      {redactionStats && (
+        <RedactionStatsDisplay stats={redactionStats} />
+      )}
+
+      {!redactionStats && (
+        <div className="relative bg-gray-50">
+          {(isLoading || isProcessing) && (
+            <div className="absolute inset-0 bg-white bg-opacity-75 flex items-center justify-center z-10">
+              <div className="animate-spin rounded-full h-12 w-12 border-4 border-blue-600 border-t-transparent"></div>
+            </div>
+          )}
+          
+          <div className="p-6 flex justify-center">
+            <canvas
+              ref={canvasRef}
+              onMouseDown={handleMouseDown}
+              onMouseMove={handleMouseMove}
+              onMouseUp={handleMouseUp}
+              className="max-w-full rounded shadow-sm"
+            />
+          </div>
+        </div>
+      )}
     </div>
   );
 } 

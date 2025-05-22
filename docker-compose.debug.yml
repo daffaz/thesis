@@ -1,0 +1,46 @@
+services:
+  api-server:
+    build:
+      context: ./api-server
+      dockerfile: Dockerfile.debug
+    ports:
+      - "8080:8080"
+      - "40000:40000"
+    entrypoint: ["sh", "-c", "dlv debug --headless --listen=:40000 --api-version=2 --accept-multiclient --log ./cmd/server"]
+    security_opt:
+      - "seccomp:unconfined"
+    cap_add:
+      - SYS_PTRACE
+    depends_on:
+      - pdf-processor
+    environment:
+      - APP_SERVICES_PDFPROCESSOR_HOST=pdf-processor
+      - APP_SERVICES_PDFPROCESSOR_PORT=50051
+      - APP_LOGGING_LEVEL=debug
+    volumes:
+      - ./api-server:/app/src
+      - ./api-server/script:/app/script
+      - ./data:/app/data
+    restart: unless-stopped
+
+  pdf-processor:
+    build: 
+      context: ./pdf-processor
+      dockerfile: Dockerfile.debug
+    volumes:
+      - ./pdf-processor/src:/app/src
+      - ./data:/app/data
+      - ./models:/app/models
+    ports:
+      - "50051:50051"
+      - "40001:40001"  # Debug port for pdf-processor
+    environment:
+      - LOG_LEVEL=DEBUG
+      - ENABLE_PII_DETECTION=true
+      - ENABLE_OCR=true
+      - TRANSLATION_MODEL_PATH=/app/models/nllb-200-distilled-600M
+    security_opt:
+      - "seccomp:unconfined"
+    cap_add:
+      - SYS_PTRACE
+    restart: unless-stopped 

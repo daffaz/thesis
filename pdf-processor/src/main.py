@@ -13,6 +13,7 @@ from pathlib import Path
 import time
 from typing import Dict, List, Optional, Tuple, Union, Any
 import grpc
+import re
 import multiprocessing
 
 import sys
@@ -191,10 +192,16 @@ class PDFProcessorServicer(pdf_processor_pb2_grpc.PDFProcessorServicer):
         except (ImportError, NotImplementedError):
             cpu_count = 2  # Fallback if cpu_count() isn't available
     
-        self.max_workers = min(4, cpu_count * 2)
-
+        # Limit max workers to avoid CPU overload
+        self.max_workers = min(max(2, cpu_count - 1), 4)  # Leave 1 CPU free, max 4 workers
         self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers)
-        logger.info(f"PDF Processor service initialized with {self.max_workers} workers")
+        
+        # Create a process pool for CPU-intensive tasks
+        self._process_pool = concurrent.futures.ProcessPoolExecutor(
+            max_workers=max(1, cpu_count - 1)  # Leave 1 CPU free
+        )
+        
+        logger.info(f"PDF Processor service initialized with {self.max_workers} thread workers and {cpu_count-1} process workers")
 
     @property
     def pdf_extractor(self):
@@ -325,9 +332,10 @@ class PDFProcessorServicer(pdf_processor_pb2_grpc.PDFProcessorServicer):
             logger.info(f"Starting background processing for job {job_id}")
             output_file_path = OUTPUT_DIR / f"{job_id}_{filename}"
 
-            # Extract text from PDF
+            # Extract text from PDF using process pool for CPU-intensive work
             logger.info(f"Extracting text from {input_file_path}")
-            document = self.pdf_extractor.extract_text(str(input_file_path))
+            future = self._process_pool.submit(self.pdf_extractor.extract_text, str(input_file_path))
+            document = future.result(timeout=300)  # 5 minute timeout
 
             # Get document metadata
             metadata = self.pdf_extractor.get_document_metadata(str(input_file_path))
@@ -342,8 +350,9 @@ class PDFProcessorServicer(pdf_processor_pb2_grpc.PDFProcessorServicer):
             # Import the language detection function
             from src.utils import detect_document_language
 
-            # Detect language
-            language = detect_document_language(first_page_text)
+            # Detect language using process pool
+            future = self._process_pool.submit(detect_document_language, first_page_text)
+            language = future.result(timeout=60)
             logger.info(f"Detected document language: {language}")
 
             # Update job with metadata
@@ -362,29 +371,24 @@ class PDFProcessorServicer(pdf_processor_pb2_grpc.PDFProcessorServicer):
                 # Create a language-appropriate PII detector
                 pii_detector = PIIDetector(language=language)
 
-                # Apply redaction with language-specific detection
-                redaction_stats = self._apply_redaction(
+                # Apply redaction with language-specific detection using process pool
+                future = self._process_pool.submit(
+                    self._apply_redaction,
                     job_id, processed_document, options, input_file_path,
-                    output_file_path, pii_detector, language=language
+                    output_file_path, pii_detector, language
                 )
+                redaction_stats = future.result(timeout=300)  # 5 minute timeout
 
             # Apply translation if requested (after the other changes)
             if options.enable_translation:
-                self._apply_translation(
+                future = self._process_pool.submit(
+                    self._apply_translation,
                     job_id, processed_document, options, output_file_path
                 )
+                translation_success = future.result(timeout=300)  # 5 minute timeout
+                if not translation_success:
+                    raise RuntimeError("Translation failed")
 
-            # Apply PII redaction if requested
-            redaction_stats = None
-            if options.enable_redaction:
-                # Create a language-specific PII detector
-                pii_detector = PIIDetector(language=language)
-
-                redaction_stats = self._apply_redaction(
-                    job_id, processed_document, options, input_file_path, output_file_path,
-                    pii_detector
-                )
-            
             # If no processing was requested, just copy the file
             if not options.enable_translation and not options.enable_redaction:
                 logger.info(f"No processing requested, copying file for job {job_id}")
@@ -399,6 +403,10 @@ class PDFProcessorServicer(pdf_processor_pb2_grpc.PDFProcessorServicer):
                 self._update_job_with_redaction_stats(job_id, redaction_stats)
                 
             logger.info(f"Successfully completed background processing for job {job_id}")
+            
+        except concurrent.futures.TimeoutError:
+            logger.error(f"Processing timeout for job {job_id}")
+            self._job_manager.update_job(job_id, "failed", error="Processing timeout")
             
         except Exception as e:
             logger.error(f"Error in background processing for job {job_id}: {str(e)}")
@@ -416,7 +424,6 @@ class PDFProcessorServicer(pdf_processor_pb2_grpc.PDFProcessorServicer):
             self._job_manager.update_job(job_id, "failed", error=str(e))
             
             # If we have a valid input file but processing failed, copy it to output
-            # This ensures the user can still download the original file
             if input_file_path.exists() and (output_file_path is None or not output_file_path.exists()):
                 try:
                     output_file_path = OUTPUT_DIR / f"{job_id}_FAILED_{filename}"
@@ -425,7 +432,10 @@ class PDFProcessorServicer(pdf_processor_pb2_grpc.PDFProcessorServicer):
                     self._job_manager.update_job(job_id, "failed", output_file=output_file_path.name)
                 except Exception as copy_error:
                     logger.error(f"Error copying original file after failure: {str(copy_error)}")
-        
+        finally:
+            # Clean up any temporary files if needed
+            pass
+
     def _apply_translation(self, job_id, document, options, output_file_path):
         """
         Apply translation to the document with error handling.
@@ -464,26 +474,37 @@ class PDFProcessorServicer(pdf_processor_pb2_grpc.PDFProcessorServicer):
             logger.error("Translation service not available")
             raise RuntimeError("Translation service not available")
 
-        # Translate the document
         try:
-            # This will modify the document in-place
+            # Translate the document in memory
             translated_document = translation_service.translate_document(
                 document,
                 source_language,
                 target_language
             )
             
-            # Update job status
-            self._job_manager.update_job(job_id, "translated", metadata={
-                "translated": "true"
-            })
-            
-            # Modify the output filename to indicate translation
+            # Prepare the output paths with language suffix
             output_lang_suffix = target_language.split('_')[0] if '_' in target_language else target_language
-            new_output_path = OUTPUT_DIR / f"{job_id}_{output_lang_suffix}_{os.path.basename(output_file_path)}"
-            output_file_path.rename(new_output_path)
+            base_name = os.path.basename(str(output_file_path))
+            # Remove any existing job_id prefix from base_name to avoid duplication
+            if base_name.startswith(job_id):
+                base_name = base_name[len(job_id)+1:]
+            new_output_path = OUTPUT_DIR / f"{job_id}_{output_lang_suffix}_{base_name}"
             
-            return True
+            # Create parent directory if it doesn't exist
+            new_output_path.parent.mkdir(parents=True, exist_ok=True)
+            
+            # Create the translated PDF directly at the new location
+            success = self._create_translated_pdf(translated_document, str(new_output_path))
+            
+            if success:
+                # Update job status with the correct filename that includes language suffix
+                self._job_manager.update_job(job_id, "completed", metadata={
+                    "translated": "true"
+                }, output_file=new_output_path.name)
+                return True
+            else:
+                raise RuntimeError("Failed to create translated PDF")
+                
         except Exception as e:
             logger.error(f"Error during translation: {str(e)}")
             self._job_manager.update_job(job_id, "translation_failed", metadata={
@@ -534,8 +555,6 @@ class PDFProcessorServicer(pdf_processor_pb2_grpc.PDFProcessorServicer):
                         nik_instances = detector.detect_nik_with_context(page_content['text'])
                         if nik_instances:
                             logger.info(f"Detected {len(nik_instances)} NIK instances on page {page_num}")
-                            # Record these for redaction
-                            # (this will be handled in the standard redaction process)
 
             # Detect and redact PII in the document
             redacted_document, redacted_items = detector.redact_document(
@@ -543,12 +562,12 @@ class PDFProcessorServicer(pdf_processor_pb2_grpc.PDFProcessorServicer):
             )
 
             logger.info(f"Detected {len(redacted_items)} items to redact for job {job_id}")
-            
+
             # Update job status
             self._job_manager.update_job(job_id, "redacting", metadata={
                 "pii_detected": str(len(redacted_items))
             })
-            
+
             # If there are items to redact, try to apply them to the PDF
             redaction_success = False
             if redacted_items:
@@ -560,26 +579,35 @@ class PDFProcessorServicer(pdf_processor_pb2_grpc.PDFProcessorServicer):
                         str(output_file_path)
                     )
                 else:
-                    # Try PyMuPDF first (more robust)
-                    logger.info(f"Attempting redaction with PyMuPDF for job {job_id}")
-                    pymupdf_success = self._redact_pdf_with_pymupdf(
+                    # First try specific phone redaction
+                    logger.info(f"Attempting phone-specific redaction for job {job_id}")
+                    phone_success = self._redact_phones_specifically(
                         str(input_file_path), str(output_file_path), redacted_items
                     )
-                    
-                    # If PyMuPDF fails, try pdf-redactor
-                    if not pymupdf_success:
-                        logger.warning(f"PyMuPDF redaction failed for job {job_id}, trying pdf-redactor")
-                        pdf_redactor_success = self._redact_pdf_with_pdf_redactor(
+
+                    if not phone_success:
+                        # Try PyMuPDF next (more robust)
+                        logger.info(f"Attempting redaction with PyMuPDF for job {job_id}")
+                        pymupdf_success = self._redact_pdf_with_pymupdf(
                             str(input_file_path), str(output_file_path), redacted_items
                         )
-                        redaction_success = pdf_redactor_success
+
+                        # If PyMuPDF fails, try pdf-redactor
+                        if not pymupdf_success:
+                            logger.warning(f"PyMuPDF redaction failed for job {job_id}, trying pdf-redactor")
+                            pdf_redactor_success = self._redact_pdf_with_pdf_redactor(
+                                str(input_file_path), str(output_file_path), redacted_items
+                            )
+                            redaction_success = pdf_redactor_success
+                        else:
+                            redaction_success = True
                     else:
                         redaction_success = True
             else:
                 # No items to redact
                 logger.info(f"No PII found to redact for job {job_id}")
                 redaction_success = True  # We consider this a success case
-                
+
                 if options.enable_translation:
                     # For translation without redaction, create a new PDF
                     redaction_success = self._create_translated_pdf(
@@ -589,20 +617,20 @@ class PDFProcessorServicer(pdf_processor_pb2_grpc.PDFProcessorServicer):
                     # Just copy the original file
                     with open(input_file_path, "rb") as src, open(output_file_path, "wb") as dst:
                         dst.write(src.read())
-                        
+
             # Get redaction statistics
             stats = self.pii_detector.get_pii_statistics(job_id, document, redaction_types)
-            
+
             # If redaction fails, provide a clear error marker
             if not redaction_success and len(redacted_items) > 0:
                 logger.error(f"All redaction methods failed for job {job_id}")
-                
+
                 # Update job with warning
                 self._job_manager.update_job(job_id, "redaction_failed", metadata={
                     "redaction_status": "FAILED",
                     "warning": f"Document redaction failed; found {len(redacted_items)} items that could not be redacted."
                 })
-                
+
                 # Copy the original file as the output (with warning)
                 with open(input_file_path, "rb") as src, open(output_file_path, "wb") as dst:
                     dst.write(src.read())
@@ -618,9 +646,9 @@ class PDFProcessorServicer(pdf_processor_pb2_grpc.PDFProcessorServicer):
                         "redaction_status": "NO_PII_FOUND"
                     })
                     logger.info(f"No PII found in document for job {job_id}")
-            
+
             return stats
-            
+
         except Exception as e:
             logger.error(f"Error redacting document for job {job_id}: {str(e)}")
             self._job_manager.update_job(job_id, "redaction_error", metadata={
@@ -652,11 +680,11 @@ class PDFProcessorServicer(pdf_processor_pb2_grpc.PDFProcessorServicer):
 
     def _create_translated_pdf(self, document, output_path):
         """
-        Create a new PDF document from translated text with better
+        Create a new PDF document from translated text with improved
         formatting preservation.
         
         Args:
-            document: Document dictionary with translated text
+            document: Document dictionary with translated text and formatting info
             output_path: Path where to save the output PDF
 
         Returns:
@@ -664,7 +692,6 @@ class PDFProcessorServicer(pdf_processor_pb2_grpc.PDFProcessorServicer):
         """
         try:
             import fitz  # PyMuPDF
-
             logger.info(f"Creating new PDF with translated content at {output_path}")
 
             # Create a new PDF document
@@ -673,62 +700,82 @@ class PDFProcessorServicer(pdf_processor_pb2_grpc.PDFProcessorServicer):
             # Process each page
             for page_num in sorted(document.keys()):
                 page_content = document[page_num]
+                
+                # Add a new page with same dimensions as original if available
+                if 'dimensions' in page_content:
+                    width, height = page_content['dimensions']
+                    page = doc.new_page(width=width, height=height)
+                else:
+                    page = doc.new_page()
 
-                # Add a new page
-                page = doc.new_page()
-
-                # Better rendering with paragraph structure
-                if 'paragraphs' in page_content and page_content['paragraphs']:
-                    # Calculate page margins
-                    margin = 50  # points
-                    content_width = page.rect.width - 2 * margin
-                    
-                    # Initial y position
-                    y_pos = margin
-                    
-                    # Process each paragraph
+                # If we have detailed text blocks with formatting
+                if 'blocks' in page_content:
+                    for block in page_content['blocks']:
+                        # Extract block properties
+                        text = block.get('text', '')
+                        font = block.get('font', 'helv')
+                        fontsize = block.get('fontsize', 11)
+                        color = block.get('color', (0, 0, 0))
+                        bbox = block.get('bbox', None)
+                        align = block.get('align', 0)  # 0=left, 1=center, 2=right
+                        
+                        if bbox:
+                            rect = fitz.Rect(bbox)
+                        else:
+                            # Default positioning if no bbox
+                            rect = fitz.Rect(50, 50, page.rect.width - 50, page.rect.height - 50)
+                        
+                        # Insert text with preserved formatting
+                        page.insert_textbox(
+                            rect,
+                            text,
+                            fontname=font,
+                            fontsize=fontsize,
+                            color=color,
+                            align=align
+                        )
+                
+                # Fallback to simpler formatting if no detailed blocks
+                elif 'paragraphs' in page_content and page_content['paragraphs']:
+                    y_pos = 50  # Starting position
                     for paragraph in page_content['paragraphs']:
                         if not paragraph.strip():
-                            # Empty paragraph - just add some space
                             y_pos += 10
                             continue
                             
-                        # Insert the paragraph text
-                        text_rect = fitz.Rect(margin, y_pos, margin + content_width, y_pos + 500)
+                        # Try to preserve paragraph spacing and indentation
+                        indent = 50
+                        if paragraph.startswith('    '):  # Check for indentation
+                            indent = 70
+                            
+                        rect = fitz.Rect(indent, y_pos, page.rect.width - 50, y_pos + 500)
                         text_height = page.insert_textbox(
-                            text_rect,
+                            rect,
                             paragraph,
                             fontname="helv",
                             fontsize=11,
-                            align=0  # 0=left, 1=center, 2=right
+                            align=0
                         )
                         
-                        # Move y position down
-                        y_pos += text_height + 10  # Add some spacing between paragraphs
+                        y_pos += text_height + 12  # Consistent paragraph spacing
                         
-                        # If we're close to the bottom, start a new page
-                        if y_pos > page.rect.height - margin:
+                        if y_pos > page.rect.height - 50:
                             page = doc.new_page()
-                            y_pos = margin
-                else:
-                    # Simple rendering - using just the main text
-                    if 'text' in page_content and page_content['text']:
-                        text = page_content['text']
-
-                        # Create a text block that fits on the page
-                        rect = fitz.Rect(50, 50, page.rect.width - 50, page.rect.height - 50)
-                        page.insert_text(
-                            fitz.Point(50, 50),  # Starting position
-                            text,
-                            fontname="helv",  # A standard font
-                            fontsize=11,
-                            rect=rect
-                        )
+                            y_pos = 50
+                
+                # Last resort - simple text insertion
+                elif 'text' in page_content and page_content['text']:
+                    rect = fitz.Rect(50, 50, page.rect.width - 50, page.rect.height - 50)
+                    page.insert_textbox(
+                        rect,
+                        page_content['text'],
+                        fontname="helv",
+                        fontsize=11
+                    )
 
             # Save the document
             doc.save(output_path)
             doc.close()
-
             logger.info(f"Successfully created translated PDF at {output_path}")
             return True
 
@@ -815,8 +862,6 @@ class PDFProcessorServicer(pdf_processor_pb2_grpc.PDFProcessorServicer):
         try:
             import fitz  # PyMuPDF
 
-            logger.info(f"Starting PDF redaction with PyMuPDF for {len(redacted_items)} items")
-
             # Open the PDF
             doc = fitz.open(input_path)
 
@@ -830,17 +875,6 @@ class PDFProcessorServicer(pdf_processor_pb2_grpc.PDFProcessorServicer):
                     if page_num not in redactions_by_page:
                         redactions_by_page[page_num] = []
                     redactions_by_page[page_num].append(item)
-
-            logger.info(f"Processing redactions across {len(redactions_by_page)} pages")
-
-            # Log specific types for debugging
-            nik_items = [item for item in redacted_items if item.get('type') == 'nik']
-            phone_items = [item for item in redacted_items if item.get('type') == 'phone']
-            email_items = [item for item in redacted_items if item.get('type') == 'email']
-
-            logger.info(f"Found {len(nik_items)} NIK items to redact")
-            logger.info(f"Found {len(phone_items)} phone items to redact")
-            logger.info(f"Found {len(email_items)} email items to redact")
 
             # Process redactions page by page
             for page_num, items in redactions_by_page.items():
@@ -874,16 +908,11 @@ class PDFProcessorServicer(pdf_processor_pb2_grpc.PDFProcessorServicer):
                                 if approach(page, text_to_redact):
                                     item_redacted = True
                                     break
-                            except Exception as e:
-                                logger.warning(f"Approach failed: {str(e)}")
+                            except Exception:
                                 continue
-
-                        if not item_redacted:
-                            logger.warning(f"Could not redact '{text_to_redact[:20]}...' with any approach")
 
                     # Apply all redactions to this page
                     page.apply_redactions()
-                    logger.info(f"Applied redactions to page {page_num}")
 
                 except Exception as e:
                     logger.error(f"Error processing page {page_num}: {str(e)}")
@@ -897,6 +926,63 @@ class PDFProcessorServicer(pdf_processor_pb2_grpc.PDFProcessorServicer):
             logger.error(f"Error in PDF redaction: {str(e)}")
             import traceback
             logger.error(traceback.format_exc())
+            return False
+
+    def _redact_phones_specifically(self, input_path, output_path, redacted_items):
+        """A specialized method to detect and redact phones in PDF documents."""
+        try:
+            import fitz  # PyMuPDF
+            doc = fitz.open(input_path)
+
+            # Extract phone items only
+            phone_items = [item for item in redacted_items
+                           if item.get('type') == 'phone' or 'HP:' in str(item.get('original', ''))]
+
+            if not phone_items:
+                return False
+
+            # Process each page
+            for page_idx in range(len(doc)):
+                page = doc[page_idx]
+                page_text = page.get_text()
+
+                # Specific patterns for phone numbers with HP: prefix
+                phone_patterns = [
+                    r'HP:?\s*\+?\d{1,4}[-\s.]?\d{1,4}[-\s.]?\d{1,4}[-\s.]?\d{1,4}',
+                    r'HP:?\s*\d{3,4}[-\s.]?\d{3,4}[-\s.]?\d{3,4}',
+                    r'HP:?\s*\d{1,4}[-\s.]?\d{1,4}[-\s.]?\d{1,4}',
+                    r'HP:?\s*\(\d{2,3}\)[-\s.]?\d{3,4}[-\s.]?\d{3,4}'
+                ]
+
+                # Find all phone numbers in this page
+                for pattern in phone_patterns:
+                    for match in re.finditer(pattern, page_text, re.IGNORECASE):
+                        match_text = match.group()
+                        # Find the text instance on the page
+                        # Try exact search first
+                        instances = page.search_for(match_text)
+                        if not instances:
+                            # Try with parts of the match
+                            prefix = match_text.split()[0] if ' ' in match_text else match_text[:3]
+                            instances = page.search_for(prefix)
+
+                        # Apply redaction to each instance
+                        for inst in instances:
+                            # Make rectangle slightly larger
+                            rect = fitz.Rect(inst.x0 - 2, inst.y0 - 2,
+                                             inst.x1 + 50, inst.y1 + 2)  # Extend width to catch full number
+                            page.add_redact_annot(rect, fill=(0, 0, 0))
+
+                # Apply redactions
+                page.apply_redactions()
+
+            # Save and close
+            doc.save(output_path)
+            doc.close()
+            return True
+
+        except Exception as e:
+            logger.error(f"Error in specific phone redaction: {str(e)}")
             return False
 
     def _redact_with_text_instance_search(self, page, text_to_redact):
@@ -1038,10 +1124,18 @@ class PDFProcessorServicer(pdf_processor_pb2_grpc.PDFProcessorServicer):
                 # Double-check that the output file exists
                 output_path = OUTPUT_DIR / output_file
                 if not output_path.exists():
-                    # File is missing, mark as error
-                    logger.warning(f"Output file {output_file} for job {job_id} is missing")
-                    status = "error"
-                    output_file = None
+                    # Try to find the file with any language suffix
+                    possible_files = list(OUTPUT_DIR.glob(f"{job_id}_*_{output_file.split('_')[-1]}"))
+                    if possible_files:
+                        # Found a matching file with language suffix
+                        output_file = possible_files[0].name
+                        # Update job data with correct filename
+                        self._job_manager.update_job(job_id, status, output_file=output_file)
+                    else:
+                        # File is missing, mark as error
+                        logger.warning(f"Output file {output_file} for job {job_id} is missing")
+                        status = "error"
+                        output_file = None
                     
             return pdf_processor_pb2.StatusResponse(
                 job_id=job_id,
@@ -1050,27 +1144,15 @@ class PDFProcessorServicer(pdf_processor_pb2_grpc.PDFProcessorServicer):
             )
         
         # If job not in tracking system, check for files
-        # Check specifically for a PDF output file first
-        pdf_output_files = list(OUTPUT_DIR.glob(f"{job_id}_*.pdf"))
-
-        if pdf_output_files:
-            logger.info(f"Found PDF output file: {pdf_output_files[0].name}")
+        # Check for any output files with job_id prefix
+        output_files = list(OUTPUT_DIR.glob(f"{job_id}_*.pdf"))
+        
+        if output_files:
+            logger.info(f"Found output file: {output_files[0].name}")
             return pdf_processor_pb2.StatusResponse(
                 job_id=job_id,
                 status="completed",
-                output_file=pdf_output_files[0].name
-            )
-
-        # If no PDF file, check for other output files
-        other_output_files = [f for f in OUTPUT_DIR.glob(f"{job_id}_*")
-                              if not f.name.endswith('_log.txt') and not f.name.endswith('_REDACTION_FAILED.txt')]
-
-        if other_output_files:
-            logger.info(f"Found non-PDF output file: {other_output_files[0].name}")
-            return pdf_processor_pb2.StatusResponse(
-                job_id=job_id,
-                status="completed",
-                output_file=other_output_files[0].name
+                output_file=output_files[0].name
             )
 
         # Check if input file exists but processing not complete

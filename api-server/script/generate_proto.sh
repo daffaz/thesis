@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/bin/sh
 # tools/generate_protos.sh
 
 # Make sure protoc is installed

@@ -2,15 +2,9 @@ services:
   api-server:
     build:
       context: ./api-server
-      dockerfile: Dockerfile.debug
+      dockerfile: Dockerfile
     ports:
       - "8080:8080"
-      - "40000:40000"
-    entrypoint: ["sh", "-c", "dlv debug --headless --listen=:40000 --api-version=2 --accept-multiclient --log ./cmd/server"]
-    security_opt:
-      - "seccomp:unconfined"
-    cap_add:
-      - SYS_PTRACE
     depends_on:
       - pdf-processor
     environment:
@@ -28,15 +22,16 @@ services:
     volumes:
       - ./pdf-processor/src:/app/src
       - ./data:/app/data
-      - ./models:/app/models  # Add volume for translation models
-    ports:
-      - "50051:50051"
+      - ./.cache/huggingface:/root/.cache/huggingface:rw  # Added :rw for explicit read-write permissions
     environment:
-      - LOG_LEVEL=INFO
+      - LOG_LEVEL=DEBUG
       - ENABLE_PII_DETECTION=true
       - ENABLE_OCR=true
-      - TRANSLATION_MODEL_PATH=/app/models/nllb-200-distilled-600M  # Path to local model
-
+      - TRANSFORMERS_CACHE=/root/.cache/huggingface
+      - TRANSFORMERS_OFFLINE=1  # Force offline mode
+      - HF_HUB_OFFLINE=1  # Prevent online checks
+    ports:
+      - "50051:50051"
     restart: unless-stopped
 
   # This will be added later when you implement full document storage
