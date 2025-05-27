@@ -13,7 +13,7 @@ class PIIDetector:
     """
 
     def __init__(self, model_name: str = "en_core_web_md", chunk_size: int = 5000,
-                 language: str = "en"):
+                 language: str = "en", enable_multithreading: bool = False):  # Changed default to False
         """
         Initialize the PII detector.
 
@@ -21,6 +21,7 @@ class PIIDetector:
             model_name: Name of the spaCy model to use
             chunk_size: Default size for text chunks when processing large documents
             language: Language code ('en' for English, 'id' for Indonesian)
+            enable_multithreading: Whether to enable multithreading (disabled by default to avoid pickle issues)
         """
         # Initialize spaCy model
         try:
@@ -45,6 +46,7 @@ class PIIDetector:
         self.redaction_marker = "***"  # Default redaction marker
         self.chunk_size = chunk_size
         self.language = language
+        self.enable_multithreading = enable_multithreading
         
         # Set up regex patterns based on language
         self._setup_regex_patterns()
@@ -52,7 +54,7 @@ class PIIDetector:
         # Set up non-PII terms to exclude
         self._setup_non_pii_terms()
 
-        logger.info(f"Initialized PIIDetector for language '{language}'")
+        logger.info(f"Initialized PIIDetector for language '{language}' with multithreading={enable_multithreading}")
 
     def _setup_regex_patterns(self):
         """Set up regex patterns for PII detection based on language"""

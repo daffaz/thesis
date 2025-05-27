@@ -1,7 +1,7 @@
 'use client';
 
 import { useEffect, useRef, useState } from 'react';
-import { PDFDocument, rgb } from 'pdf-lib';
+import { PDFDocument, rgb, PDFName, PDFArray, PDFDict, PDFRef, PDFStream, PDFString, PDFNumber } from 'pdf-lib';
 import type { PDFDocumentProxy, PageViewport, RenderTask } from 'pdfjs-dist';
 import { api, RedactionStats } from '@/services/api';
 
@@ -68,6 +68,7 @@ export default function PDFViewer({ file, mode, onReset }: PDFViewerProps) {
   const [isProcessing, setIsProcessing] = useState(false);
   const [processingStatus, setProcessingStatus] = useState<string>('');
   const [redactionStats, setRedactionStats] = useState<RedactionStats | null>(null);
+  const [autoRedactedFile, setAutoRedactedFile] = useState<File | null>(null);
 
   const renderPage = async (doc: PDFDocumentProxy, pageNumber: number) => {
     if (!doc) return;
@@ -205,12 +206,27 @@ export default function PDFViewer({ file, mode, onReset }: PDFViewerProps) {
     setStartPoint(null);
   };
 
+  const handlePrevPage = () => {
+    if (currentPage > 1) {
+      setCurrentPage(currentPage - 1);
+    }
+  };
+
+  const handleNextPage = () => {
+    if (currentPage < totalPages) {
+      setCurrentPage(currentPage + 1);
+    }
+  };
+
   const applyRedactions = async () => {
     if (!pdfDoc) return;
 
     try {
+      // Use the auto-redacted file in combined mode, otherwise use original file
+      const sourceFile = mode === 'combined' && autoRedactedFile ? autoRedactedFile : file;
+      
       // Create a new PDF document using pdf-lib
-      const pdfBytes = await file.arrayBuffer();
+      const pdfBytes = await sourceFile.arrayBuffer();
       const pdfLibDoc = await PDFDocument.load(pdfBytes);
 
       // Apply redactions to each page
@@ -233,17 +249,60 @@ export default function PDFViewer({ file, mode, onReset }: PDFViewerProps) {
         const pdfWidth = area.width * scaleX;
         const pdfHeight = area.height * scaleY;
 
-        page.drawRectangle({
-          x: pdfX,
-          y: pdfY,
-          width: pdfWidth,
-          height: pdfHeight,
-          color: rgb(0, 0, 0),
-        });
+        // First, remove any annotations (links, form fields) in the redacted area
+        const annotationsArray = page.node.lookup(PDFName.of('Annots')) as PDFArray | undefined;
+        if (annotationsArray) {
+          const annotations = annotationsArray.asArray();
+          const newAnnotations: PDFDict[] = [];
+          
+          for (const annotation of annotations) {
+            if (annotation instanceof PDFDict) {
+              const annotRect = annotation.lookup(PDFName.of('Rect')) as PDFArray | undefined;
+              if (annotRect) {
+                const coords = annotRect.asArray().map(num => {
+                  if (num instanceof PDFNumber) {
+                    return num.asNumber();
+                  }
+                  return 0;
+                });
+                const [x1, y1, x2, y2] = coords;
+                // Check if annotation overlaps with redaction area
+                const overlaps = !(
+                  x2 < pdfX || 
+                  x1 > pdfX + pdfWidth || 
+                  y2 < pdfY || 
+                  y1 > pdfY + pdfHeight
+                );
+                if (!overlaps) {
+                  newAnnotations.push(annotation);
+                }
+              } else {
+                newAnnotations.push(annotation);
+              }
+            }
+          }
+          
+          // Update annotations array
+          page.node.set(PDFName.of('Annots'), pdfLibDoc.context.obj(newAnnotations));
+        }
+
+        // Draw multiple layers of black rectangles for better coverage
+        for (let i = 0; i < 3; i++) {
+          page.drawRectangle({
+            x: pdfX,
+            y: pdfY,
+            width: pdfWidth,
+            height: pdfHeight,
+            color: rgb(0, 0, 0),
+            opacity: 1,
+          });
+        }
       }
 
       // Save the redacted PDF
-      const redactedPdfBytes = await pdfLibDoc.save();
+      const redactedPdfBytes = await pdfLibDoc.save({
+        useObjectStreams: false,
+      });
       const blob = new Blob([redactedPdfBytes], { type: 'application/pdf' });
       const url = URL.createObjectURL(blob);
 
@@ -257,6 +316,7 @@ export default function PDFViewer({ file, mode, onReset }: PDFViewerProps) {
       URL.revokeObjectURL(url);
     } catch (error) {
       console.error('Error applying redactions:', error);
+      setError('Failed to apply redactions. Please try again.');
     }
   };
 
@@ -283,20 +343,38 @@ export default function PDFViewer({ file, mode, onReset }: PDFViewerProps) {
       if (response.redactedPdfUrl) {
         const redactedPdfResponse = await fetch(response.redactedPdfUrl);
         const blob = await redactedPdfResponse.blob();
-        const url = URL.createObjectURL(blob);
-
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = `redacted-${file.name}`;
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
-        URL.revokeObjectURL(url);
-      }
-
-      // Don't reset immediately if we have stats to show
-      if (!response.redactionStats) {
-        onReset();
+        
+        // In combined mode, we want to load the auto-redacted PDF for manual redaction
+        if (mode === 'combined') {
+          const autoRedactedFile = new File([blob], `auto-redacted-${file.name}`, { type: 'application/pdf' });
+          setAutoRedactedFile(autoRedactedFile);
+          
+          // Reinitialize PDF.js with the auto-redacted file
+          const fileArrayBuffer = await autoRedactedFile.arrayBuffer();
+          const loadingTask = pdfjsLib.getDocument({ data: fileArrayBuffer });
+          const loadedPdf = await loadingTask.promise;
+          
+          setPdfDoc(loadedPdf);
+          setTotalPages(loadedPdf.numPages);
+          setCurrentPage(1);
+          setRedactionAreas([]); // Clear any existing redaction areas
+          setProcessingStatus('Auto-redaction complete. You can now add manual redactions.');
+        } else {
+          // In auto mode, just download the file
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          a.href = url;
+          a.download = `redacted-${file.name}`;
+          document.body.appendChild(a);
+          a.click();
+          document.body.removeChild(a);
+          URL.revokeObjectURL(url);
+          
+          // Don't reset immediately if we have stats to show
+          if (!response.redactionStats) {
+            onReset();
+          }
+        }
       }
     } catch (error) {
       console.error('Error during auto-redaction:', error);
@@ -309,8 +387,13 @@ export default function PDFViewer({ file, mode, onReset }: PDFViewerProps) {
   const handleRedaction = async () => {
     if (mode === 'auto') {
       await handleAutoRedaction();
+    } else if (mode === 'combined' && !autoRedactedFile) {
+      await handleAutoRedaction();
     } else {
       await applyRedactions();
+      if (mode === 'combined') {
+        onReset(); // Reset after applying manual redactions in combined mode
+      }
     }
   };
 
@@ -430,7 +513,9 @@ export default function PDFViewer({ file, mode, onReset }: PDFViewerProps) {
           </h2>
           {mode !== 'auto' && (
             <p className="text-sm text-gray-500">
-              Draw rectangles to redact sensitive information
+              {mode === 'combined' && !autoRedactedFile 
+                ? 'First, the document will be auto-redacted' 
+                : 'Draw rectangles to redact sensitive information'}
             </p>
           )}
         </div>
@@ -440,16 +525,20 @@ export default function PDFViewer({ file, mode, onReset }: PDFViewerProps) {
             className="px-4 py-2 text-sm font-medium text-gray-700 hover:bg-gray-100 rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
             disabled={isProcessing}
           >
-            {redactionStats ? 'Done' : 'Cancel'}
+            {redactionStats && mode !== 'combined' ? 'Done' : 'Cancel'}
           </button>
-          {!redactionStats && (
+          {(!redactionStats || (mode === 'combined' && autoRedactedFile)) && (
             <button
               onClick={handleRedaction}
               className="px-4 py-2 text-sm font-medium text-white bg-blue-600 hover:bg-blue-700 rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center"
-              disabled={isProcessing || (mode !== 'auto' && redactionAreas.length === 0)}
+              disabled={isProcessing || (mode !== 'auto' && mode !== 'combined' && redactionAreas.length === 0)}
             >
               <span>
-                {mode === 'auto' ? 'Start Auto-Redaction' : 'Apply Redactions'}
+                {mode === 'auto' 
+                  ? 'Start Auto-Redaction' 
+                  : mode === 'combined' && !autoRedactedFile
+                    ? 'Start Auto-Redaction'
+                    : 'Apply Redactions'}
               </span>
               {(isProcessing || isLoading) && (
                 <svg className="animate-spin ml-2 h-4 w-4 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
@@ -468,27 +557,52 @@ export default function PDFViewer({ file, mode, onReset }: PDFViewerProps) {
         </div>
       )}
 
-      {redactionStats && (
+      {redactionStats && mode !== 'combined' && (
         <RedactionStatsDisplay stats={redactionStats} />
       )}
 
-      {!redactionStats && (
-        <div className="relative bg-gray-50">
-          {(isLoading || isProcessing) && (
-            <div className="absolute inset-0 bg-white bg-opacity-75 flex items-center justify-center z-10">
-              <div className="animate-spin rounded-full h-12 w-12 border-4 border-blue-600 border-t-transparent"></div>
+      {(!redactionStats || mode === 'combined') && (
+        <div className="space-y-4">
+          <div className="relative bg-gray-50">
+            {(isLoading || isProcessing) && (
+              <div className="absolute inset-0 bg-white bg-opacity-75 flex items-center justify-center z-10">
+                <div className="animate-spin rounded-full h-12 w-12 border-4 border-blue-600 border-t-transparent"></div>
+              </div>
+            )}
+            
+            <div className="p-6 flex justify-center">
+              <canvas
+                ref={canvasRef}
+                onMouseDown={handleMouseDown}
+                onMouseMove={handleMouseMove}
+                onMouseUp={handleMouseUp}
+                className="max-w-full rounded shadow-sm"
+              />
+            </div>
+          </div>
+
+          {/* Page Navigation */}
+          {totalPages > 1 && (
+            <div className="flex items-center justify-center space-x-4">
+              <button
+                onClick={handlePrevPage}
+                disabled={currentPage === 1 || isLoading}
+                className="px-3 py-1 text-sm font-medium text-gray-700 hover:bg-gray-100 rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                Previous
+              </button>
+              <span className="text-sm text-gray-600">
+                Page {currentPage} of {totalPages}
+              </span>
+              <button
+                onClick={handleNextPage}
+                disabled={currentPage === totalPages || isLoading}
+                className="px-3 py-1 text-sm font-medium text-gray-700 hover:bg-gray-100 rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                Next
+              </button>
             </div>
           )}
-          
-          <div className="p-6 flex justify-center">
-            <canvas
-              ref={canvasRef}
-              onMouseDown={handleMouseDown}
-              onMouseMove={handleMouseMove}
-              onMouseUp={handleMouseUp}
-              className="max-w-full rounded shadow-sm"
-            />
-          </div>
         </div>
       )}
     </div>

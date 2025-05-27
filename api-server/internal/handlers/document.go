@@ -4,16 +4,18 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
-	"github.com/gin-gonic/gin"
-	"github.com/google/uuid"
 	"server_pdf_processor/internal/client"
 	"server_pdf_processor/internal/models"
+
+	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 )
 
 // DocumentHandler handles document processing requests
@@ -265,6 +267,71 @@ func (h *DocumentHandler) DownloadDocument(c *gin.Context) {
 
 	// Serve the file
 	c.File(filePath)
+
+	// 🎯 START CLEANUP GOROUTINE - Delete files after 5 minutes
+	go func(jobID string) {
+		// Wait 5 minutes
+		time.Sleep(2 * time.Second)
+
+		// Delete output file
+		outputFile := filepath.Join("/app/data/output", status.OutputFile)
+		if err := os.Remove(outputFile); err != nil {
+			log.Printf("Failed to delete output file %s: %v", outputFile, err)
+		} else {
+			log.Printf("✅ Deleted output file: %s", outputFile)
+		}
+
+		// Delete input file(s) - find files with jobID prefix
+		inputDir := "/app/data/input"
+		inputPattern := filepath.Join(inputDir, jobID+"_*")
+
+		if inputFiles, err := filepath.Glob(inputPattern); err == nil {
+			for _, inputFile := range inputFiles {
+				if err := os.Remove(inputFile); err != nil {
+					log.Printf("Failed to delete input file %s: %v", inputFile, err)
+				} else {
+					log.Printf("✅ Deleted input file: %s", inputFile)
+				}
+			}
+		}
+
+		// Delete output files - find files with jobID prefix
+		outputDir := "/app/data/output"
+		outputPattern := filepath.Join(outputDir, jobID+"_*")
+		if outputFiles, err := filepath.Glob(outputPattern); err == nil {
+			for _, outputFile := range outputFiles {
+				if err := os.Remove(outputFile); err != nil {
+					log.Printf("Failed to delete input file %s: %v", outputFile, err)
+				} else {
+					log.Printf("✅ Deleted input file: %s", outputFile)
+				}
+			}
+		}
+
+		// Delete any error logs
+		errorLogFile := filepath.Join("/app/data/output", jobID+"_error.log")
+		if _, err := os.Stat(errorLogFile); err == nil {
+			if err := os.Remove(errorLogFile); err != nil {
+				log.Printf("Failed to delete error log %s: %v", errorLogFile, err)
+			} else {
+				log.Printf("✅ Deleted error log: %s", errorLogFile)
+			}
+		}
+
+		// Delete job metadata file
+		jobFile := filepath.Join("/app/data/jobs", jobID+".json")
+		if _, err := os.Stat(jobFile); err == nil {
+			if err := os.Remove(jobFile); err != nil {
+				log.Printf("Failed to delete job file %s: %v", jobFile, err)
+			} else {
+				log.Printf("✅ Deleted job metadata: %s", jobFile)
+			}
+		}
+
+		log.Printf("🗑️ Cleanup completed for job: %s", jobID)
+	}(jobID)
+
+	log.Printf("[DOWNLOAD] File served for job %s, cleanup scheduled in 5 minutes", jobID)
 }
 
 // DetectPII handles PII detection requests (streaming)

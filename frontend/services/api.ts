@@ -8,7 +8,7 @@ export interface RedactionStats {
 }
 
 export interface ProcessingResponse {
-  jobId: string;
+  job_id: string;
   originalFilename: string;
   status: string;
   metadata?: { [key: string]: string };
@@ -28,8 +28,8 @@ export const api = {
     const formData = new FormData();
     formData.append('document', file);
     formData.append('options', JSON.stringify({
-      enableRedaction: true,
-      preserveFormatting: true,
+      "enable_redaction": true,
+      "preserve_formatting": true,
     }));
 
     try {
@@ -45,7 +45,7 @@ export const api = {
       }
 
       const processingResponse: ProcessingResponse = await response.json();
-      const jobId = processingResponse.jobId;
+      const jobId = processingResponse.job_id;
 
       if (!jobId) {
         throw new Error('No job ID received from server');
@@ -56,7 +56,7 @@ export const api = {
       const maxAttempts = 60; // 5 minutes with 5-second intervals
       
       while (attempts < maxAttempts) {
-        const statusResponse = await fetch(`${API_BASE_URL}/api/status/${jobId}`);
+        const statusResponse = await fetch(`${API_BASE_URL}/api/documents/status/${jobId}`);
         
         if (!statusResponse.ok) {
           if (statusResponse.status === 404) {
@@ -71,7 +71,7 @@ export const api = {
           // Get the redacted document
           return {
             success: true,
-            redactedPdfUrl: `${API_BASE_URL}/api/download/${jobId}`,
+            redactedPdfUrl: `${API_BASE_URL}/api/documents/download/${jobId}`,
             jobId: jobId,
             redactionStats: statusData.redactionStats,
           };
@@ -81,7 +81,7 @@ export const api = {
         }
 
         // Wait before next attempt
-        await new Promise(resolve => setTimeout(resolve, 5000));
+        await new Promise(resolve => setTimeout(resolve, 3000));
         attempts++;
       }
 
@@ -116,7 +116,7 @@ export const api = {
       }
 
       const processingResponse: ProcessingResponse = await response.json();
-      const jobId = processingResponse.jobId;
+      const jobId = processingResponse.job_id;
 
       if (!jobId) {
         throw new Error('No job ID received from server');
@@ -127,7 +127,7 @@ export const api = {
       const maxAttempts = 60; // 5 minutes with 5-second intervals
       
       while (attempts < maxAttempts) {
-        const statusResponse = await fetch(`${API_BASE_URL}/api/status/${jobId}`);
+        const statusResponse = await fetch(`${API_BASE_URL}/api/documents/status/${jobId}`);
         
         if (!statusResponse.ok) {
           if (statusResponse.status === 404) {
@@ -141,7 +141,7 @@ export const api = {
         if (statusData.status === 'completed') {
           return {
             success: true,
-            redactedPdfUrl: `${API_BASE_URL}/api/download/${jobId}`,
+            redactedPdfUrl: `${API_BASE_URL}/api/documents/download/${jobId}`,
             jobId: jobId,
           };
         } else if (statusData.status === 'error' || statusData.status === 'failed') {

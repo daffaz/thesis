@@ -14,13 +14,14 @@ import time
 from typing import Dict, List, Optional, Tuple, Union, Any
 import grpc
 import re
-import multiprocessing
-
+import signal
 import sys
+
+# Add the parent directory to sys.path for imports
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from generated import processor_pb2 as pdf_processor_pb2
 from generated import processor_pb2_grpc as pdf_processor_pb2_grpc
-from src.pii_detector.pii_detector import PIIDetector
 
 # Configure logging
 logging.basicConfig(
@@ -158,7 +159,7 @@ class JobManager:
                             
                             # Remove from cache
                             job_id = job_data.get("job_id")
-                            if job_id in self._job_cache:
+                            if job_id and job_id in self._job_cache:
                                 del self._job_cache[job_id]
                                 
                             logger.info(f"Cleaned up old job {job_id}")
@@ -183,25 +184,12 @@ class PDFProcessorServicer(pdf_processor_pb2_grpc.PDFProcessorServicer):
         """Initialize the service with lazy loading of components"""
         self._pdf_extractor = None
         self._pii_detector = None
-        self._translation_service = None
         self._job_manager = JobManager()
-
-        try:
-            import multiprocessing
-            cpu_count = multiprocessing.cpu_count()
-        except (ImportError, NotImplementedError):
-            cpu_count = 2  # Fallback if cpu_count() isn't available
-    
-        # Limit max workers to avoid CPU overload
-        self.max_workers = min(max(2, cpu_count - 1), 4)  # Leave 1 CPU free, max 4 workers
-        self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers)
         
-        # Create a process pool for CPU-intensive tasks
-        self._process_pool = concurrent.futures.ProcessPoolExecutor(
-            max_workers=max(1, cpu_count - 1)  # Leave 1 CPU free
-        )
+        # Use ThreadPoolExecutor instead of ProcessPoolExecutor to avoid pickling issues
+        self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
         
-        logger.info(f"PDF Processor service initialized with {self.max_workers} thread workers and {cpu_count-1} process workers")
+        logger.info(f"PDF Processor service initialized with ThreadPoolExecutor")
 
     @property
     def pdf_extractor(self):
@@ -218,24 +206,10 @@ class PDFProcessorServicer(pdf_processor_pb2_grpc.PDFProcessorServicer):
     def pii_detector(self):
         """Lazy load the PII detector"""
         if self._pii_detector is None:
-            self._pii_detector = PIIDetector(
-                enable_multithreading=True
-            )
+            from src.pii_detector.pii_detector import PIIDetector
+            self._pii_detector = PIIDetector(enable_multithreading=False)  # Disable threading to avoid pickle issues
             logger.info("Initialized PIIDetector")
         return self._pii_detector
-
-    def get_translation_service(self, force_reload=False):
-        """Get or initialize the translation service"""
-        if self._translation_service is None or force_reload:
-            try:
-                from src.translation.translation import TranslationService
-                model_path = os.getenv('TRANSLATION_MODEL_PATH')
-                self._translation_service = TranslationService(model_path)
-                logger.info(f"Initialized TranslationService with model from {model_path or 'HuggingFace'}")
-            except Exception as e:
-                logger.error(f"Error initializing translation service: {str(e)}")
-                return None
-        return self._translation_service
 
     def ProcessDocument(self, request, context):
         """
@@ -295,36 +269,6 @@ class PDFProcessorServicer(pdf_processor_pb2_grpc.PDFProcessorServicer):
             context.set_details(f"Error initiating document processing: {str(e)}")
             return pdf_processor_pb2.ProcessResponse()
 
-    def detect_language(self, text: str) -> str:
-        """
-        Detect the language of the text.
-        Currently supports English and Indonesian.
-
-        Args:
-            text: Text to analyze
-
-        Returns:
-            Language code ('en' or 'id')
-        """
-        # Simple detection based on common Indonesian words
-        indonesian_words = [
-            "dan", "yang", "di", "ini", "dengan", "untuk", "tidak", "dalam",
-            "adalah", "pada", "akan", "dari", "telah", "oleh", "atau", "juga",
-            "ke", "karena", "tersebut", "bisa", "ada", "mereka", "lebih", "tahun",
-            "sudah", "saya", "kita", "seperti", "kami", "kepada", "hanya", "banyak",
-            "sebagai", "jalan", "nomor", "satu", "dua", "tiga", "empat", "lima"
-        ]
-
-        # Count Indonesian words in the text
-        text_lower = text.lower()
-        indonesian_word_count = sum(1 for word in indonesian_words if f" {word} " in f" {text_lower} ")
-
-        # If more than 5 Indonesian words found, consider it Indonesian
-        # This is a simple heuristic - consider using langdetect library for better results
-        if indonesian_word_count > 5:
-            return "id"
-        return "en"
-
     def _process_document_background(self, job_id, input_file_path, filename, options):
         """Process a document in the background with comprehensive error handling."""
         output_file_path = None
@@ -332,10 +276,9 @@ class PDFProcessorServicer(pdf_processor_pb2_grpc.PDFProcessorServicer):
             logger.info(f"Starting background processing for job {job_id}")
             output_file_path = OUTPUT_DIR / f"{job_id}_{filename}"
 
-            # Extract text from PDF using process pool for CPU-intensive work
+            # Extract text from PDF
             logger.info(f"Extracting text from {input_file_path}")
-            future = self._process_pool.submit(self.pdf_extractor.extract_text, str(input_file_path))
-            document = future.result(timeout=300)  # 5 minute timeout
+            document = self.pdf_extractor.extract_text(str(input_file_path))
 
             # Get document metadata
             metadata = self.pdf_extractor.get_document_metadata(str(input_file_path))
@@ -347,12 +290,8 @@ class PDFProcessorServicer(pdf_processor_pb2_grpc.PDFProcessorServicer):
                     first_page_text = document[page_num]['text']
                     break
 
-            # Import the language detection function
-            from src.utils import detect_document_language
-
-            # Detect language using process pool
-            future = self._process_pool.submit(detect_document_language, first_page_text)
-            language = future.result(timeout=60)
+            # Simple language detection
+            language = self._detect_language(first_page_text)
             logger.info(f"Detected document language: {language}")
 
             # Update job with metadata
@@ -368,24 +307,16 @@ class PDFProcessorServicer(pdf_processor_pb2_grpc.PDFProcessorServicer):
             # Apply redaction if requested
             redaction_stats = None
             if options.enable_redaction:
-                # Create a language-appropriate PII detector
-                pii_detector = PIIDetector(language=language)
-
-                # Apply redaction with language-specific detection using process pool
-                future = self._process_pool.submit(
-                    self._apply_redaction,
+                redaction_stats = self._apply_redaction(
                     job_id, processed_document, options, input_file_path,
-                    output_file_path, pii_detector, language
+                    output_file_path, language
                 )
-                redaction_stats = future.result(timeout=300)  # 5 minute timeout
 
-            # Apply translation if requested (after the other changes)
+            # Apply translation if requested (after redaction)
             if options.enable_translation:
-                future = self._process_pool.submit(
-                    self._apply_translation,
+                translation_success = self._apply_translation(
                     job_id, processed_document, options, output_file_path
                 )
-                translation_success = future.result(timeout=300)  # 5 minute timeout
                 if not translation_success:
                     raise RuntimeError("Translation failed")
 
@@ -403,10 +334,6 @@ class PDFProcessorServicer(pdf_processor_pb2_grpc.PDFProcessorServicer):
                 self._update_job_with_redaction_stats(job_id, redaction_stats)
                 
             logger.info(f"Successfully completed background processing for job {job_id}")
-            
-        except concurrent.futures.TimeoutError:
-            logger.error(f"Processing timeout for job {job_id}")
-            self._job_manager.update_job(job_id, "failed", error="Processing timeout")
             
         except Exception as e:
             logger.error(f"Error in background processing for job {job_id}: {str(e)}")
@@ -432,100 +359,39 @@ class PDFProcessorServicer(pdf_processor_pb2_grpc.PDFProcessorServicer):
                     self._job_manager.update_job(job_id, "failed", output_file=output_file_path.name)
                 except Exception as copy_error:
                     logger.error(f"Error copying original file after failure: {str(copy_error)}")
-        finally:
-            # Clean up any temporary files if needed
-            pass
 
-    def _apply_translation(self, job_id, document, options, output_file_path):
+    def _detect_language(self, text: str) -> str:
         """
-        Apply translation to the document with error handling.
+        Simple language detection for Indonesian vs English.
         
         Args:
-            job_id: Unique job identifier
-            document: Document to translate (will be modified in-place)
-            options: Processing options
-            output_file_path: Path where to save the output file
+            text: Text to analyze
             
         Returns:
-            True if translation was successful, False otherwise
+            Language code ('en' or 'id')
         """
-        # Check if translation is enabled
-        if not options.enable_translation:
-            return True
-            
-        source_language = options.source_language if options.source_language else None
-        target_language = options.target_language
+        # Indonesian common words that strongly indicate the language
+        indonesian_indicators = [
+            "dan", "yang", "di", "ini", "dengan", "untuk", "tidak", "dalam",
+            "adalah", "pada", "akan", "dari", "telah", "oleh", "atau", "juga",
+            "ke", "karena", "tersebut", "bisa", "ada", "mereka", "lebih", "tahun",
+            "sudah", "saya", "kita", "seperti", "kami", "kepada", "hanya", "banyak",
+            "sebagai", "jalan", "nomor", "satu", "dua", "tiga", "empat", "lima"
+        ]
 
-        if not target_language:
-            logger.error("Target language is required for translation")
-            raise ValueError("Target language is required for translation")
+        # Count Indonesian words in the text
+        text_lower = text.lower()
+        indonesian_count = sum(1 for word in indonesian_indicators if f" {word} " in f" {text_lower} ")
 
-        logger.info(f"Translating document from {source_language or 'auto-detected'} to {target_language}")
-        
-        # Update job status
-        self._job_manager.update_job(job_id, "translating", metadata={
-            "source_language": source_language or "auto-detect",
-            "target_language": target_language
-        })
+        # If more than 5 Indonesian indicator words are found, consider it Indonesian
+        if indonesian_count > 5:
+            logger.info(f"Detected Indonesian language with {indonesian_count} indicator words")
+            return "id"
+        return "en"
 
-        # Initialize translation service
-        translation_service = self.get_translation_service()
-        if translation_service is None:
-            logger.error("Translation service not available")
-            raise RuntimeError("Translation service not available")
-
-        try:
-            # Translate the document in memory
-            translated_document = translation_service.translate_document(
-                document,
-                source_language,
-                target_language
-            )
-            
-            # Prepare the output paths with language suffix
-            output_lang_suffix = target_language.split('_')[0] if '_' in target_language else target_language
-            base_name = os.path.basename(str(output_file_path))
-            # Remove any existing job_id prefix from base_name to avoid duplication
-            if base_name.startswith(job_id):
-                base_name = base_name[len(job_id)+1:]
-            new_output_path = OUTPUT_DIR / f"{job_id}_{output_lang_suffix}_{base_name}"
-            
-            # Create parent directory if it doesn't exist
-            new_output_path.parent.mkdir(parents=True, exist_ok=True)
-            
-            # Create the translated PDF directly at the new location
-            success = self._create_translated_pdf(translated_document, str(new_output_path))
-            
-            if success:
-                # Update job status with the correct filename that includes language suffix
-                self._job_manager.update_job(job_id, "completed", metadata={
-                    "translated": "true"
-                }, output_file=new_output_path.name)
-                return True
-            else:
-                raise RuntimeError("Failed to create translated PDF")
-                
-        except Exception as e:
-            logger.error(f"Error during translation: {str(e)}")
-            self._job_manager.update_job(job_id, "translation_failed", metadata={
-                "translation_error": str(e)
-            })
-            return False
-
-    def _apply_redaction(self, job_id, document, options, input_file_path, output_file_path, pii_detector=None, language="en"):
+    def _apply_redaction(self, job_id, document, options, input_file_path, output_file_path, language="en"):
         """
         Apply PII redaction to the document with error handling and fallback strategies.
-
-        Args:
-            job_id: Unique job identifier
-            document: Document to redact
-            options: Processing options
-            input_file_path: Path to the input file
-            output_file_path: Path where to save the output file
-            pii_detector: Optional custom PII detector for language-specific detection
-
-        Returns:
-            RedactionStats if redaction was successful, None otherwise
         """
         # Check if redaction is enabled
         if not options.enable_redaction:
@@ -540,21 +406,8 @@ class PDFProcessorServicer(pdf_processor_pb2_grpc.PDFProcessorServicer):
         })
 
         try:
-            # Use the provided PII detector or create a new one
-            detector = pii_detector or self.pii_detector
-
-            # For Indonesian documents, add special NIK detection
-            if language == "id":
-                # Find NIKs specifically in each page
-                for page_num, page_content in document.items():
-                    if 'text' in page_content and page_content['text']:
-                        names = pii_detector.detect_indonesian_names(page_content['text'])
-                        if names:
-                            logger.info(f"Detected {len(names)} Indonesian names on page {page_num}")
-
-                        nik_instances = detector.detect_nik_with_context(page_content['text'])
-                        if nik_instances:
-                            logger.info(f"Detected {len(nik_instances)} NIK instances on page {page_num}")
+            # Create a language-appropriate PII detector
+            detector = self.pii_detector
 
             # Detect and redact PII in the document
             redacted_document, redacted_items = detector.redact_document(
@@ -571,66 +424,36 @@ class PDFProcessorServicer(pdf_processor_pb2_grpc.PDFProcessorServicer):
             # If there are items to redact, try to apply them to the PDF
             redaction_success = False
             if redacted_items:
-                # Try different redaction strategies
-                if options.enable_translation:
-                    # For translation + redaction, create a new PDF
-                    redaction_success = self._create_translated_pdf(
-                        redacted_document,
-                        str(output_file_path)
-                    )
-                else:
-                    # First try specific phone redaction
-                    logger.info(f"Attempting phone-specific redaction for job {job_id}")
-                    phone_success = self._redact_phones_specifically(
+                # Try PyMuPDF redaction
+                logger.info(f"Attempting redaction with PyMuPDF for job {job_id}")
+                redaction_success = self._redact_pdf_with_pymupdf(
+                    str(input_file_path), str(output_file_path), redacted_items
+                )
+
+                # If PyMuPDF fails, try pdf-redactor
+                if not redaction_success:
+                    logger.warning(f"PyMuPDF redaction failed for job {job_id}, trying pdf-redactor")
+                    redaction_success = self._redact_pdf_with_pdf_redactor(
                         str(input_file_path), str(output_file_path), redacted_items
                     )
-
-                    if not phone_success:
-                        # Try PyMuPDF next (more robust)
-                        logger.info(f"Attempting redaction with PyMuPDF for job {job_id}")
-                        pymupdf_success = self._redact_pdf_with_pymupdf(
-                            str(input_file_path), str(output_file_path), redacted_items
-                        )
-
-                        # If PyMuPDF fails, try pdf-redactor
-                        if not pymupdf_success:
-                            logger.warning(f"PyMuPDF redaction failed for job {job_id}, trying pdf-redactor")
-                            pdf_redactor_success = self._redact_pdf_with_pdf_redactor(
-                                str(input_file_path), str(output_file_path), redacted_items
-                            )
-                            redaction_success = pdf_redactor_success
-                        else:
-                            redaction_success = True
-                    else:
-                        redaction_success = True
             else:
                 # No items to redact
                 logger.info(f"No PII found to redact for job {job_id}")
-                redaction_success = True  # We consider this a success case
-
-                if options.enable_translation:
-                    # For translation without redaction, create a new PDF
-                    redaction_success = self._create_translated_pdf(
-                        document, str(output_file_path)
-                    )
-                else:
-                    # Just copy the original file
-                    with open(input_file_path, "rb") as src, open(output_file_path, "wb") as dst:
-                        dst.write(src.read())
+                redaction_success = True
+                # Just copy the original file
+                with open(input_file_path, "rb") as src, open(output_file_path, "wb") as dst:
+                    dst.write(src.read())
 
             # Get redaction statistics
             stats = self.pii_detector.get_pii_statistics(job_id, document, redaction_types)
 
-            # If redaction fails, provide a clear error marker
+            # Handle redaction results
             if not redaction_success and len(redacted_items) > 0:
                 logger.error(f"All redaction methods failed for job {job_id}")
-
-                # Update job with warning
                 self._job_manager.update_job(job_id, "redaction_failed", metadata={
                     "redaction_status": "FAILED",
                     "warning": f"Document redaction failed; found {len(redacted_items)} items that could not be redacted."
                 })
-
                 # Copy the original file as the output (with warning)
                 with open(input_file_path, "rb") as src, open(output_file_path, "wb") as dst:
                     dst.write(src.read())
@@ -651,138 +474,121 @@ class PDFProcessorServicer(pdf_processor_pb2_grpc.PDFProcessorServicer):
 
         except Exception as e:
             logger.error(f"Error redacting document for job {job_id}: {str(e)}")
+            import traceback
+            logger.error(traceback.format_exc())
             self._job_manager.update_job(job_id, "redaction_error", metadata={
                 "redaction_error": str(e)
             })
             return None
+
+    def _apply_translation(self, job_id, document, options, output_file_path):
+        """
+        Apply translation to the document - placeholder for now.
+        """
+        if not options.enable_translation:
+            return True
             
-    def _update_job_with_redaction_stats(self, job_id, stats):
-        """Update job with redaction statistics"""
-        # Convert stats to metadata
-        metadata = {
-            "total_pii_count": str(stats.get('total_pii_count', 0))
-        }
-        
-        # Add type breakdown
-        type_stats = []
-        for pii_type, count in stats.get('by_type', {}).items():
-            type_stats.append(f"{pii_type}:{count}")
-        metadata["pii_by_type"] = ",".join(type_stats)
-        
-        # Add method breakdown
-        method_stats = []
-        for method, count in stats.get('by_method', {}).items():
-            method_stats.append(f"{method}:{count}")
-        metadata["pii_by_method"] = ",".join(method_stats)
-        
-        # Update job
-        self._job_manager.update_job(job_id, "completed", metadata=metadata)
+        logger.warning("Translation feature is currently disabled")
+        return False
 
-    def _create_translated_pdf(self, document, output_path):
-        """
-        Create a new PDF document from translated text with improved
-        formatting preservation.
-        
-        Args:
-            document: Document dictionary with translated text and formatting info
-            output_path: Path where to save the output PDF
-
-        Returns:
-            Boolean indicating success
-        """
+    def _redact_pdf_with_pymupdf(self, input_path, output_path, redacted_items):
+        """Apply redactions to a PDF file with improved handling for different languages."""
         try:
             import fitz  # PyMuPDF
-            logger.info(f"Creating new PDF with translated content at {output_path}")
 
-            # Create a new PDF document
-            doc = fitz.open()
+            # Open the PDF
+            doc = fitz.open(input_path)
 
-            # Process each page
-            for page_num in sorted(document.keys()):
-                page_content = document[page_num]
-                
-                # Add a new page with same dimensions as original if available
-                if 'dimensions' in page_content:
-                    width, height = page_content['dimensions']
-                    page = doc.new_page(width=width, height=height)
-                else:
-                    page = doc.new_page()
+            # Group redactions by page and create redaction annotations
+            redactions_by_page = {}
 
-                # If we have detailed text blocks with formatting
-                if 'blocks' in page_content:
-                    for block in page_content['blocks']:
-                        # Extract block properties
-                        text = block.get('text', '')
-                        font = block.get('font', 'helv')
-                        fontsize = block.get('fontsize', 11)
-                        color = block.get('color', (0, 0, 0))
-                        bbox = block.get('bbox', None)
-                        align = block.get('align', 0)  # 0=left, 1=center, 2=right
-                        
-                        if bbox:
-                            rect = fitz.Rect(bbox)
-                        else:
-                            # Default positioning if no bbox
-                            rect = fitz.Rect(50, 50, page.rect.width - 50, page.rect.height - 50)
-                        
-                        # Insert text with preserved formatting
-                        page.insert_textbox(
-                            rect,
-                            text,
-                            fontname=font,
-                            fontsize=fontsize,
-                            color=color,
-                            align=align
-                        )
-                
-                # Fallback to simpler formatting if no detailed blocks
-                elif 'paragraphs' in page_content and page_content['paragraphs']:
-                    y_pos = 50  # Starting position
-                    for paragraph in page_content['paragraphs']:
-                        if not paragraph.strip():
-                            y_pos += 10
+            # Group by page
+            for item in redacted_items:
+                if "page" in item:
+                    page_num = item["page"]
+                    if page_num not in redactions_by_page:
+                        redactions_by_page[page_num] = []
+                    redactions_by_page[page_num].append(item)
+
+            # Process redactions page by page
+            for page_num, items in redactions_by_page.items():
+                try:
+                    # Adjust for 0-based indexing in PyMuPDF
+                    page_idx = page_num - 1
+                    if page_idx < 0 or page_idx >= len(doc):
+                        logger.warning(f"Page {page_num} out of range (document has {len(doc)} pages)")
+                        continue
+
+                    page = doc[page_idx]
+
+                    # Apply redactions to each item
+                    for item in items:
+                        if 'original' not in item:
                             continue
-                            
-                        # Try to preserve paragraph spacing and indentation
-                        indent = 50
-                        if paragraph.startswith('    '):  # Check for indentation
-                            indent = 70
-                            
-                        rect = fitz.Rect(indent, y_pos, page.rect.width - 50, y_pos + 500)
-                        text_height = page.insert_textbox(
-                            rect,
-                            paragraph,
-                            fontname="helv",
-                            fontsize=11,
-                            align=0
-                        )
-                        
-                        y_pos += text_height + 12  # Consistent paragraph spacing
-                        
-                        if y_pos > page.rect.height - 50:
-                            page = doc.new_page()
-                            y_pos = 50
-                
-                # Last resort - simple text insertion
-                elif 'text' in page_content and page_content['text']:
-                    rect = fitz.Rect(50, 50, page.rect.width - 50, page.rect.height - 50)
-                    page.insert_textbox(
-                        rect,
-                        page_content['text'],
-                        fontname="helv",
-                        fontsize=11
-                    )
 
-            # Save the document
+                        text_to_redact = item['original']
+                        
+                        # Try to find and redact the text
+                        success = self._redact_text_on_page(page, text_to_redact)
+                        if success:
+                            logger.debug(f"Successfully redacted '{text_to_redact[:20]}...' on page {page_num}")
+
+                    # Apply all redactions to this page
+                    page.apply_redactions()
+
+                except Exception as e:
+                    logger.error(f"Error processing page {page_num}: {str(e)}")
+
+            # Save the redacted document
             doc.save(output_path)
             doc.close()
-            logger.info(f"Successfully created translated PDF at {output_path}")
             return True
 
         except Exception as e:
-            logger.error(f"Error creating translated PDF: {str(e)}")
+            logger.error(f"Error in PDF redaction: {str(e)}")
             import traceback
             logger.error(traceback.format_exc())
+            return False
+
+    def _redact_text_on_page(self, page, text_to_redact):
+        """Try multiple strategies to redact text on a page."""
+        try:
+            # Strategy 1: Direct text search
+            text_instances = page.search_for(text_to_redact)
+            if text_instances:
+                for inst in text_instances:
+                    page.add_redact_annot(inst, fill=(0, 0, 0))
+                return True
+
+            # Strategy 2: Search for parts of the text
+            if len(text_to_redact) > 10:
+                # Try first half
+                first_half = text_to_redact[:len(text_to_redact)//2]
+                instances = page.search_for(first_half)
+                if instances:
+                    for inst in instances:
+                        # Extend the rectangle to cover more text
+                        extended_rect = fitz.Rect(
+                            inst.x0, inst.y0,
+                            inst.x1 + len(text_to_redact) * 6,  # Approximate character width
+                            inst.y1
+                        )
+                        page.add_redact_annot(extended_rect, fill=(0, 0, 0))
+                    return True
+
+            # Strategy 3: Look through text blocks
+            blocks = page.get_text("blocks")
+            for block in blocks:
+                block_text = block[4]  # Text content is the 5th element
+                if text_to_redact in block_text or text_to_redact.lower() in block_text.lower():
+                    # Create a redaction rectangle covering the text block
+                    rect = fitz.Rect(block[:4])  # First 4 elements are rectangle coordinates
+                    page.add_redact_annot(rect, fill=(0, 0, 0))
+                    return True
+
+            return False
+        except Exception as e:
+            logger.error(f"Error redacting text on page: {str(e)}")
             return False
 
     def _redact_pdf_with_pdf_redactor(self, input_path, output_path, redacted_items):
@@ -803,7 +609,6 @@ class PDFProcessorServicer(pdf_processor_pb2_grpc.PDFProcessorServicer):
             for item in redacted_items:
                 if "original" in item and item["original"]:
                     text_to_redact.append(item["original"])
-                    logger.debug(f"Adding text to redact: '{item['original'][:30]}...' (truncated for log)")
 
             if not text_to_redact:
                 logger.warning("No text items found to redact!")
@@ -857,252 +662,27 @@ class PDFProcessorServicer(pdf_processor_pb2_grpc.PDFProcessorServicer):
             logger.error(traceback.format_exc())
             return False
 
-    def _redact_pdf_with_pymupdf(self, input_path, output_path, redacted_items):
-        """Apply redactions to a PDF file with improved handling for different languages."""
-        try:
-            import fitz  # PyMuPDF
-
-            # Open the PDF
-            doc = fitz.open(input_path)
-
-            # Group redactions by page and create redaction annotations
-            redactions_by_page = {}
-
-            # Group by page
-            for item in redacted_items:
-                if "page" in item:
-                    page_num = item["page"]
-                    if page_num not in redactions_by_page:
-                        redactions_by_page[page_num] = []
-                    redactions_by_page[page_num].append(item)
-
-            # Process redactions page by page
-            for page_num, items in redactions_by_page.items():
-                try:
-                    # Adjust for 0-based indexing in PyMuPDF
-                    page_idx = page_num - 1
-                    if page_idx < 0 or page_idx >= len(doc):
-                        logger.warning(f"Page {page_num} out of range (document has {len(doc)} pages)")
-                        continue
-
-                    page = doc[page_idx]
-
-                    # Use multiple approaches to redact each item
-                    redaction_approaches = [
-                        self._redact_with_exact_search,
-                        self._redact_with_fuzzy_search,
-                        self._redact_with_text_instance_search,
-                        self._redact_with_block_scan
-                    ]
-
-                    for item in items:
-                        if 'original' not in item:
-                            continue
-
-                        text_to_redact = item['original']
-
-                        # Try each approach
-                        item_redacted = False
-                        for approach in redaction_approaches:
-                            try:
-                                if approach(page, text_to_redact):
-                                    item_redacted = True
-                                    break
-                            except Exception:
-                                continue
-
-                    # Apply all redactions to this page
-                    page.apply_redactions()
-
-                except Exception as e:
-                    logger.error(f"Error processing page {page_num}: {str(e)}")
-
-            # Save the redacted document
-            doc.save(output_path)
-            doc.close()
-            return True
-
-        except Exception as e:
-            logger.error(f"Error in PDF redaction: {str(e)}")
-            import traceback
-            logger.error(traceback.format_exc())
-            return False
-
-    def _redact_phones_specifically(self, input_path, output_path, redacted_items):
-        """A specialized method to detect and redact phones in PDF documents."""
-        try:
-            import fitz  # PyMuPDF
-            doc = fitz.open(input_path)
-
-            # Extract phone items only
-            phone_items = [item for item in redacted_items
-                           if item.get('type') == 'phone' or 'HP:' in str(item.get('original', ''))]
-
-            if not phone_items:
-                return False
-
-            # Process each page
-            for page_idx in range(len(doc)):
-                page = doc[page_idx]
-                page_text = page.get_text()
-
-                # Specific patterns for phone numbers with HP: prefix
-                phone_patterns = [
-                    r'HP:?\s*\+?\d{1,4}[-\s.]?\d{1,4}[-\s.]?\d{1,4}[-\s.]?\d{1,4}',
-                    r'HP:?\s*\d{3,4}[-\s.]?\d{3,4}[-\s.]?\d{3,4}',
-                    r'HP:?\s*\d{1,4}[-\s.]?\d{1,4}[-\s.]?\d{1,4}',
-                    r'HP:?\s*\(\d{2,3}\)[-\s.]?\d{3,4}[-\s.]?\d{3,4}'
-                ]
-
-                # Find all phone numbers in this page
-                for pattern in phone_patterns:
-                    for match in re.finditer(pattern, page_text, re.IGNORECASE):
-                        match_text = match.group()
-                        # Find the text instance on the page
-                        # Try exact search first
-                        instances = page.search_for(match_text)
-                        if not instances:
-                            # Try with parts of the match
-                            prefix = match_text.split()[0] if ' ' in match_text else match_text[:3]
-                            instances = page.search_for(prefix)
-
-                        # Apply redaction to each instance
-                        for inst in instances:
-                            # Make rectangle slightly larger
-                            rect = fitz.Rect(inst.x0 - 2, inst.y0 - 2,
-                                             inst.x1 + 50, inst.y1 + 2)  # Extend width to catch full number
-                            page.add_redact_annot(rect, fill=(0, 0, 0))
-
-                # Apply redactions
-                page.apply_redactions()
-
-            # Save and close
-            doc.save(output_path)
-            doc.close()
-            return True
-
-        except Exception as e:
-            logger.error(f"Error in specific phone redaction: {str(e)}")
-            return False
-
-    def _redact_with_text_instance_search(self, page, text_to_redact):
-        """More aggressive text search for redaction."""
-        # Get all text instances from the page using get_text
-        page_text = page.get_text("text")
-
-        if text_to_redact in page_text:
-            # Text exists but may be broken up - search using character positions
-            text_instances = page.search_for(text_to_redact)
-
-            if not text_instances and len(text_to_redact) > 5:
-                # Try with partial matches for longer text
-                partial_text = text_to_redact[:len(text_to_redact)//2]
-                text_instances = page.search_for(partial_text)
-
-                if text_instances:
-                    # Expand the matches to cover potential full text
-                    expanded_instances = []
-                    for inst in text_instances:
-                        expanded = fitz.Rect(inst.x0, inst.y0,
-                                             inst.x0 + len(text_to_redact) * 8,  # approximate width
-                                             inst.y1)
-                        expanded_instances.append(expanded)
-                    text_instances = expanded_instances
-
-            # Add redaction annotations
-            for inst in text_instances:
-                redact_annot = page.add_redact_annot(inst, fill=(0, 0, 0))
-                if redact_annot:
-                    return True
-
-        return False
-            
-    def _redact_with_exact_search(self, page, text_to_find):
-        """Try exact text search redaction"""
-        text_instances = page.search_for(text_to_find)
-        if text_instances:
-            # Add each instance as a redaction
-            for inst in text_instances:
-                # Create redaction annotation - black fill
-                redact_annot = page.add_redact_annot(inst, fill=(0, 0, 0))
-                if not redact_annot:
-                    logger.warning(f"Failed to create redaction annotation for '{text_to_find[:20]}...'")
-            return True
-        return False
+    def _update_job_with_redaction_stats(self, job_id, stats):
+        """Update job with redaction statistics"""
+        # Convert stats to metadata
+        metadata = {
+            "total_pii_count": str(stats.get('total_pii_count', 0))
+        }
         
-    def _redact_with_fuzzy_search(self, page, text_to_find):
-        """Try fuzzy search redaction for cases with spacing/formatting differences"""
-        # Remove extra spaces for fuzzy matching
-        fuzzy_text = ' '.join(text_to_find.split())
+        # Add type breakdown
+        type_stats = []
+        for pii_type, count in stats.get('by_type', {}).items():
+            type_stats.append(f"{pii_type}:{count}")
+        metadata["pii_by_type"] = ",".join(type_stats)
         
-        # Try several variants
-        variants = [
-            fuzzy_text,
-            fuzzy_text.lower(),
-            fuzzy_text.upper(),
-            fuzzy_text.replace(' ', ''),
-            ''.join(c for c in fuzzy_text if c.isalnum())
-        ]
+        # Add method breakdown
+        method_stats = []
+        for method, count in stats.get('by_method', {}).items():
+            method_stats.append(f"{method}:{count}")
+        metadata["pii_by_method"] = ",".join(method_stats)
         
-        for variant in variants:
-            if variant == fuzzy_text:  # Skip the original as we already tried it
-                continue
-                
-            text_instances = page.search_for(variant)
-            if text_instances:
-                # Add each instance as a redaction
-                for inst in text_instances:
-                    # Create redaction annotation - black fill
-                    redact_annot = page.add_redact_annot(inst, fill=(0, 0, 0))
-                    if redact_annot:
-                        return True
-        return False
-        
-    def _redact_with_block_scan(self, page, text_to_find):
-        """Scan text blocks for the target text"""
-        # Get all text blocks on the page
-        blocks = page.get_text("blocks")
-        
-        for block in blocks:
-            block_text = block[4]  # Text content is the 5th element
-            
-            if text_to_find in block_text or text_to_find.lower() in block_text.lower():
-                logger.info(f"Found text in a block: '{text_to_find[:20]}...'")
-                
-                # Create a redaction rectangle covering the text block
-                rect = fitz.Rect(block[:4])  # First 4 elements are rectangle coordinates
-                redact_annot = page.add_redact_annot(rect, fill=(0, 0, 0))
-                
-                if redact_annot:
-                    return True
-        return False
-        
-    def _redact_with_page_dict_scan(self, page, text_to_find):
-        """Use the page dictionary to scan for text"""
-        # This is the most aggressive approach - scan the entire page
-        page_dict = page.get_text("dict")
-        
-        # Look through all blocks
-        for block in page_dict.get("blocks", []):
-            # Check lines
-            for line in block.get("lines", []):
-                for span in line.get("spans", []):
-                    span_text = span.get("text", "")
-                    
-                    if text_to_find in span_text or text_to_find.lower() in span_text.lower():
-                        # Found the text, create a redaction
-                        bbox = fitz.Rect(span["bbox"])
-                        # Add some padding
-                        bbox.x0 -= 2
-                        bbox.y0 -= 2
-                        bbox.x1 += 2
-                        bbox.y1 += 2
-                        
-                        redact_annot = page.add_redact_annot(bbox, fill=(0, 0, 0))
-                        if redact_annot:
-                            return True
-        
-        return False
+        # Update job
+        self._job_manager.update_job(job_id, "completed", metadata=metadata)
 
     def GetStatus(self, request, context):
         """
@@ -1191,17 +771,6 @@ class PDFProcessorServicer(pdf_processor_pb2_grpc.PDFProcessorServicer):
                 # Process each page
                 for page_num, page_content in document.items():
                     if 'text' in page_content:
-                        # TODO REMOVE LATER
-                        logger.info(f"Page {page_num} full text: {page_content['text']}")
-
-                        # TODO REMOVE LATER ALSO
-                        patterns = [
-                            r'\d{4}[-]\d{4}[-]\d{4}[-]\d{4}',  # Dashes
-                            r'\d{4}\s\d{4}\s\d{4}\s\d{4}',     # Spaces
-                            r'\d{16}',                          # No separators
-                            r'\d{4}.?\d{4}.?\d{4}.?\d{4}'       # Any separator
-                        ]
-                        
                         # For large pages, process in chunks
                         if len(page_content['text']) > 50000:  # ~10 pages of text
                             logger.info(f"Processing large page {page_num} in chunks")
@@ -1245,9 +814,7 @@ def serve():
     """Start the gRPC server with health checking and graceful shutdown"""
     # Create server with more workers for better concurrency
     server = grpc.server(
-        concurrent.futures.ThreadPoolExecutor(
-            max_workers=min(12, (multiprocessing.cpu_count() or 4) * 3)
-        )
+        concurrent.futures.ThreadPoolExecutor(max_workers=10)
     )
     
     # Register service
@@ -1294,6 +861,4 @@ def serve():
 
 
 if __name__ == '__main__':
-    # Import signal module for graceful shutdown
-    import signal
     serve()
